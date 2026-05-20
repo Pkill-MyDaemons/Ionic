@@ -27,6 +27,7 @@ let TOK_KW_BOOL    = 20;
 let TOK_KW_STRING  = 21;
 let TOK_KW_TENSOR  = 22;
 let TOK_KW_VOID    = 23;
+let TOK_KW_MODEL   = 58;
 // Hardware annotations
 let TOK_AT_GPU = 24;
 let TOK_AT_CPU = 25;
@@ -226,6 +227,7 @@ fn keyword_kind(string s) -> int64 {
     if (str_eq(s, "bool"))     { return TOK_KW_BOOL; }
     if (str_eq(s, "string"))   { return TOK_KW_STRING; }
     if (str_eq(s, "tensor"))   { return TOK_KW_TENSOR; }
+    if (str_eq(s, "model"))    { return TOK_KW_MODEL; }
     if (str_eq(s, "void"))     { return TOK_KW_VOID; }
     return TOK_IDENT;
 }
@@ -511,7 +513,7 @@ fn tok_kind_name(int64 k) -> string {
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
-let src = "fn add(int64 a, int64 b) -> int64 { return a + b; }\nlet x = add(1, 2);";
+let src = file_read("src/lexer.ionic");
 
 mut lx = make_lexer(src);
 

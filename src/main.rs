@@ -68,8 +68,27 @@ fn main() {
         .unwrap_or_else(|e| die(&format!("Cannot write IR: {}", e)));
 
     let clang = find_clang();
+
+    // Compile the model runtime C file if present
+    let runtime_c = runtime_c_path();
+    let runtime_obj = "/tmp/ionic_model_runtime.o";
+    let has_runtime = if let Some(ref rc) = runtime_c {
+        let st = Command::new(&clang)
+            .args(["-c", rc.as_str(), "-o", runtime_obj])
+            .status()
+            .unwrap_or_else(|e| die(&format!("Cannot compile model runtime ({}): {}", rc, e)));
+        st.success()
+    } else {
+        false
+    };
+
+    let mut clang_args: Vec<&str> = vec![&ir_path, "-o", &out_bin, "-lm"];
+    if has_runtime {
+        clang_args.push(runtime_obj);
+    }
+
     let status = Command::new(&clang)
-        .args([&ir_path, "-o", &out_bin, "-lm"])
+        .args(&clang_args)
         .status()
         .unwrap_or_else(|e| die(&format!("Cannot run clang ({}): {}", clang, e)));
 
@@ -140,6 +159,23 @@ fn parse_args(args: &[String]) -> (String, Flags) {
     }
 
     (source, flags)
+}
+
+/// Find ionic_model_runtime.c relative to the compiler binary or source tree.
+fn runtime_c_path() -> Option<String> {
+    // 1. Next to the compiler binary
+    if let Ok(exe) = std::env::current_exe() {
+        let candidate = exe.parent()?.join("ionic_model_runtime.c");
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    // 2. In the source tree (dev mode)
+    let candidate = Path::new("src/ionic_model_runtime.c");
+    if candidate.exists() {
+        return Some(candidate.to_string_lossy().into_owned());
+    }
+    None
 }
 
 fn find_clang() -> String {

@@ -50,6 +50,13 @@ impl SemanticAnalyzer {
         sa.functions.insert("int64_to_str".to_string(),(vec![Type::Int64], Type::Str));
         sa.functions.insert("float64_to_str".to_string(),(vec![Type::Float64], Type::Str));
         sa.functions.insert("char_to_str".to_string(), (vec![Type::Int64], Type::Str));
+        // System builtins
+        sa.functions.insert("get_arg".to_string(),         (vec![Type::Int64], Type::Str));
+        sa.functions.insert("cpu_core_count".to_string(),  (vec![],            Type::Int64));
+        sa.functions.insert("file_exists".to_string(),     (vec![Type::Str],   Type::Bool));
+        // ML model builtins
+        sa.functions.insert("load_model".to_string(),
+            (vec![Type::Str], Type::Model(Box::new(HwTarget::Cpu))));
         // File I/O builtins
         sa.functions.insert("file_read".to_string(),  (vec![Type::Str], Type::Str));
         sa.functions.insert("file_write".to_string(), (vec![Type::Str, Type::Str], Type::Bool));
@@ -90,15 +97,38 @@ impl SemanticAnalyzer {
     }
 
     fn analyze_fn(&mut self, f: &FnDef) {
+        // If @gpu-annotated, enter gpu block context automatically
+        let was_gpu = self.in_gpu_block;
+        if let Some(hw) = &f.hw {
+            if hw.is_gpu() {
+                self.in_gpu_block = true;
+            }
+        }
         self.push_scope();
         for p in &f.params {
-            self.declare_var(&p.name, p.ty.to_type(), false);
+            let pty = p.ty.to_type();
+            // Warn if param hw annotation conflicts with function hw annotation
+            if let (Some(fn_hw), Some(p_hw)) = (&f.hw, &p.hw) {
+                if fn_hw.is_gpu() && p_hw.is_cpu() {
+                    self.error(format!(
+                        "Function `{}` is @gpu but parameter `{}` is @cpu — remove one annotation",
+                        f.name, p.name
+                    ));
+                } else if fn_hw.is_cpu() && p_hw.is_gpu() {
+                    self.error(format!(
+                        "Function `{}` is @cpu but parameter `{}` is @gpu — remove one annotation",
+                        f.name, p.name
+                    ));
+                }
+            }
+            self.declare_var(&p.name, pty, false);
         }
         let ret_ty = f.ret_ty.to_type();
         for stmt in &f.body {
             self.analyze_stmt(stmt, &ret_ty);
         }
         self.pop_scope();
+        self.in_gpu_block = was_gpu;
     }
 
     fn push_scope(&mut self) { self.scopes.push(Scope { vars: HashMap::new() }); }
@@ -125,7 +155,7 @@ impl SemanticAnalyzer {
 
     fn analyze_stmt(&mut self, stmt: &Stmt, ret_ty: &Type) {
         match stmt {
-            Stmt::Let { mutable, name, ty, init } => {
+            Stmt::Let { mutable, name, ty, init, hw: _ } => {
                 let inferred = self.infer_expr(init);
                 let resolved = if let Some(annotation) = ty {
                     let ann_ty = annotation.to_type();
@@ -260,11 +290,11 @@ impl SemanticAnalyzer {
 
     fn check_gpu_restrictions(&mut self, expr: &Expr) {
         let forbidden = ["file_read", "file_write", "file_open_read", "file_open_write",
-                         "file_read_line", "file_write_line", "file_close"];
+                         "file_read_line", "file_write_line", "file_close", "load_model"];
         if let Expr::Call { callee, .. } = expr {
             if forbidden.contains(&callee.as_str()) {
                 self.error(format!(
-                    "GPU block: `{}` performs file I/O which is forbidden inside gpu blocks", callee
+                    "GPU block: `{}` is not allowed inside gpu blocks", callee
                 ));
             }
         }
@@ -337,10 +367,15 @@ impl SemanticAnalyzer {
                 match (&obj_ty, method.as_str()) {
                     (Type::Tensor(_), "mean" | "sum") => Type::Float64,
                     (Type::Tensor(hw), "pow") => Type::Tensor(hw.clone()),
-                    (Type::Array(inner), "len") => Type::Int64,
-                    (Type::Array(inner), "push") => Type::Void,
+                    (Type::Array(_), "len") => Type::Int64,
+                    (Type::Array(_), "push") => Type::Void,
                     (Type::Array(inner), "pop") => *inner.clone(),
                     (Type::Str, "len") => Type::Int64,
+                    // model.forward(tensor) -> tensor (same hw target)
+                    (Type::Model(hw), "forward") => Type::Tensor(hw.clone()),
+                    // model.to_gpu() / model.to_cpu()
+                    (Type::Model(_), "to_gpu") => Type::Model(Box::new(HwTarget::Gpu)),
+                    (Type::Model(_), "to_cpu") => Type::Model(Box::new(HwTarget::Cpu)),
                     _ => Type::Unknown,
                 }
             }

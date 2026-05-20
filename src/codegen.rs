@@ -78,7 +78,7 @@ impl Codegen {
         match ty {
             Type::Int64 | Type::Bool => "i64",
             Type::Float64 => "double",
-            Type::Str | Type::Array(_) | Type::Tensor(_) | Type::Struct(_) => "ptr",
+            Type::Str | Type::Array(_) | Type::Tensor(_) | Type::Model(_) | Type::Struct(_) => "ptr",
             Type::Void | Type::Unknown => "void",
         }
     }
@@ -94,7 +94,7 @@ impl Codegen {
     // ── Ptr ↔ i64 coercions for array element storage ────────────────────────
 
     fn is_ptr_ty(ty: &Type) -> bool {
-        matches!(ty, Type::Str | Type::Array(_) | Type::Struct(_) | Type::Tensor(_))
+        matches!(ty, Type::Str | Type::Array(_) | Type::Struct(_) | Type::Tensor(_) | Type::Model(_))
     }
 
     fn ptr_to_i64(&mut self, val: &str, ty: &Type) -> String {
@@ -189,6 +189,18 @@ impl Codegen {
         self.emit("declare ptr  @fgets(ptr, i32, ptr)");
         self.emit("declare i32  @fputs(ptr, ptr)");
         self.emit("declare i32  @feof(ptr)");
+        self.emit("declare i32  @fseek(ptr, i64, i32)");
+        self.emit("declare i64  @ftell(ptr)");
+        self.emit("declare i64  @fread(ptr, i64, i64, ptr)");
+        // ML model runtime (ionic_model_runtime.c)
+        self.emit("declare ptr  @ionic_load_model(ptr)");
+        self.emit("declare ptr  @ionic_model_forward(ptr, ptr)");
+        self.emit("declare void @ionic_model_free(ptr)");
+        // System runtime
+        self.emit("declare void @ionic_runtime_init(i32, ptr)");
+        self.emit("declare ptr  @ionic_get_arg(i64)");
+        self.emit("declare i64  @ionic_cpu_core_count()");
+        self.emit("declare i32  @access(ptr, i32)");  // POSIX file_exists
         self.emit("");
 
         // Emit Ionic runtime helpers
@@ -207,6 +219,20 @@ impl Codegen {
             ));
         }
         if !struct_names.is_empty() { self.emit(""); }
+
+        // Pre-emit top-level immutable integer constants as LLVM globals
+        // so function bodies can reference them.
+        let mut had_globals = false;
+        for stmt in &program.top_level {
+            if let Stmt::Let { mutable: false, name, ty: _, init, hw: _ } = stmt {
+                if let Expr::IntLit(n) = init {
+                    self.emit(&format!("@{} = private global i64 {}, align 8", name, n));
+                    self.declare_var(name, format!("@{}", name), Type::Int64);
+                    had_globals = true;
+                }
+            }
+        }
+        if had_globals { self.emit(""); }
 
         let fns: Vec<FnDef> = program.fns.clone();
         for f in &fns {
@@ -229,23 +255,23 @@ impl Codegen {
     }
 
     fn emit_runtime_helpers(&mut self) {
-        // ail_array_new(element_size, capacity) -> ptr
-        // Layout: [len:i64][cap:i64][data...]
+        // Array layout: 24-byte header [len:i64][cap:i64][data_ptr:ptr] + separate data heap.
+        // Keeping the header address stable lets push realloc data without invalidating callers.
         self.emit("; --- Ionic runtime: dynamic array ---");
         self.emit("define ptr @ionic_array_new(i64 %elem_size, i64 %cap) {");
         self.emit("entry:");
-        self.emit("  %header = mul i64 8, 2");
+        self.emit("  %hdr = call ptr @malloc(i64 24)");       // 3 x i64 header
         self.emit("  %data_size = mul i64 %elem_size, %cap");
-        self.emit("  %total = add i64 %header, %data_size");
-        self.emit("  %buf = call ptr @malloc(i64 %total)");
-        self.emit("  store i64 0, ptr %buf, align 8");
-        self.emit("  %cap_ptr = getelementptr i64, ptr %buf, i64 1");
-        self.emit("  store i64 %cap, ptr %cap_ptr, align 8");
-        self.emit("  ret ptr %buf");
+        self.emit("  %data = call ptr @malloc(i64 %data_size)");
+        self.emit("  store i64 0, ptr %hdr, align 8");                        // len = 0
+        self.emit("  %cap_f = getelementptr i64, ptr %hdr, i64 1");
+        self.emit("  store i64 %cap, ptr %cap_f, align 8");                   // cap
+        self.emit("  %dat_f = getelementptr i64, ptr %hdr, i64 2");
+        self.emit("  store ptr %data, ptr %dat_f, align 8");                  // data_ptr
+        self.emit("  ret ptr %hdr");
         self.emit("}");
         self.emit("");
 
-        // ail_array_len(arr) -> i64
         self.emit("define i64 @ionic_array_len(ptr %arr) {");
         self.emit("entry:");
         self.emit("  %len = load i64, ptr %arr, align 8");
@@ -253,37 +279,49 @@ impl Codegen {
         self.emit("}");
         self.emit("");
 
-        // ail_array_get(arr, idx) -> i64  (all elements treated as i64/ptr)
         self.emit("define i64 @ionic_array_get(ptr %arr, i64 %idx) {");
         self.emit("entry:");
-        self.emit("  %data = getelementptr i64, ptr %arr, i64 2");
-        self.emit("  %elem_ptr = getelementptr i64, ptr %data, i64 %idx");
-        self.emit("  %val = load i64, ptr %elem_ptr, align 8");
+        self.emit("  %dat_f = getelementptr i64, ptr %arr, i64 2");
+        self.emit("  %dp = load ptr, ptr %dat_f, align 8");
+        self.emit("  %ep = getelementptr i64, ptr %dp, i64 %idx");
+        self.emit("  %val = load i64, ptr %ep, align 8");
         self.emit("  ret i64 %val");
         self.emit("}");
         self.emit("");
 
-        // ail_array_set(arr, idx, val)
         self.emit("define void @ionic_array_set(ptr %arr, i64 %idx, i64 %val) {");
         self.emit("entry:");
-        self.emit("  %data = getelementptr i64, ptr %arr, i64 2");
-        self.emit("  %elem_ptr = getelementptr i64, ptr %data, i64 %idx");
-        self.emit("  store i64 %val, ptr %elem_ptr, align 8");
+        self.emit("  %dat_f = getelementptr i64, ptr %arr, i64 2");
+        self.emit("  %dp = load ptr, ptr %dat_f, align 8");
+        self.emit("  %ep = getelementptr i64, ptr %dp, i64 %idx");
+        self.emit("  store i64 %val, ptr %ep, align 8");
         self.emit("  ret void");
         self.emit("}");
         self.emit("");
 
-        // ail_array_push(arr, val) — grows if needed
+        // push: doubles capacity via realloc when full; header address is stable.
         self.emit("define void @ionic_array_push(ptr %arr, i64 %val) {");
         self.emit("entry:");
-        self.emit("  %len = load i64, ptr %arr, align 8");
-        self.emit("  %cap_ptr = getelementptr i64, ptr %arr, i64 1");
-        self.emit("  %cap = load i64, ptr %cap_ptr, align 8");
-        self.emit("  %data = getelementptr i64, ptr %arr, i64 2");
-        self.emit("  %elem_ptr = getelementptr i64, ptr %data, i64 %len");
-        self.emit("  store i64 %val, ptr %elem_ptr, align 8");
-        self.emit("  %new_len = add i64 %len, 1");
-        self.emit("  store i64 %new_len, ptr %arr, align 8");
+        self.emit("  %len     = load i64, ptr %arr, align 8");
+        self.emit("  %cap_f   = getelementptr i64, ptr %arr, i64 1");
+        self.emit("  %cap     = load i64, ptr %cap_f, align 8");
+        self.emit("  %dat_f   = getelementptr i64, ptr %arr, i64 2");
+        self.emit("  %dp      = load ptr, ptr %dat_f, align 8");
+        self.emit("  %full    = icmp sge i64 %len, %cap");
+        self.emit("  br i1 %full, label %grow, label %store");
+        self.emit("grow:");
+        self.emit("  %new_cap  = mul i64 %cap, 2");
+        self.emit("  %new_sz   = mul i64 %new_cap, 8");
+        self.emit("  %new_dp   = call ptr @realloc(ptr %dp, i64 %new_sz)");
+        self.emit("  store i64 %new_cap, ptr %cap_f, align 8");
+        self.emit("  store ptr %new_dp, ptr %dat_f, align 8");
+        self.emit("  br label %store");
+        self.emit("store:");
+        self.emit("  %cur_dp  = load ptr, ptr %dat_f, align 8");
+        self.emit("  %ep      = getelementptr i64, ptr %cur_dp, i64 %len");
+        self.emit("  store i64 %val, ptr %ep, align 8");
+        self.emit("  %nlen    = add i64 %len, 1");
+        self.emit("  store i64 %nlen, ptr %arr, align 8");
         self.emit("  ret void");
         self.emit("}");
         self.emit("");
@@ -338,33 +376,20 @@ impl Codegen {
         self.emit("@mode_r = private constant [2 x i8] c\"r\\00\"");
         self.emit("@mode_w = private constant [2 x i8] c\"w\\00\"");
 
-        // file_read(path) -> string (reads entire file)
+        // file_read(path) -> string (reads entire file via fseek/ftell/fread)
         self.emit("define ptr @ionic_file_read(ptr %path) {");
         self.emit("entry:");
         self.emit("  %fp = call ptr @fopen(ptr %path, ptr @mode_r)");
-        self.emit("  %buf = call ptr @malloc(i64 65536)");
-        self.emit("  %out = call ptr @malloc(i64 1)");
-        self.emit("  store i8 0, ptr %out, align 1");
-        self.emit("  %len_slot = alloca i64, align 8");
-        self.emit("  store i64 0, ptr %len_slot, align 8");
-        self.emit("  br label %read_loop");
-        self.emit("read_loop:");
-        self.emit("  %line = call ptr @fgets(ptr %buf, i32 65536, ptr %fp)");
-        self.emit("  %is_null = icmp eq ptr %line, null");
-        self.emit("  br i1 %is_null, label %read_done, label %read_body");
-        self.emit("read_body:");
-        self.emit("  %new_out = call ptr @ionic_str_concat(ptr %out, ptr %buf)");
-        self.emit("  store ptr %new_out, ptr %len_slot, align 8");
-        self.emit("  br label %read_loop");
-        self.emit("read_done:");
+        self.emit("  call i32 @fseek(ptr %fp, i64 0, i32 2)");   // SEEK_END=2
+        self.emit("  %fsz = call i64 @ftell(ptr %fp)");
+        self.emit("  call i32 @fseek(ptr %fp, i64 0, i32 0)");   // SEEK_SET=0
+        self.emit("  %bufsz = add i64 %fsz, 1");
+        self.emit("  %buf = call ptr @malloc(i64 %bufsz)");
+        self.emit("  call i64 @fread(ptr %buf, i64 1, i64 %fsz, ptr %fp)");
+        self.emit("  %end = getelementptr i8, ptr %buf, i64 %fsz");
+        self.emit("  store i8 0, ptr %end, align 1");
         self.emit("  call i32 @fclose(ptr %fp)");
-        self.emit("  %result = load ptr, ptr %len_slot, align 8");
-        self.emit("  %is_empty = icmp eq ptr %result, null");
-        self.emit("  br i1 %is_empty, label %ret_empty, label %ret_result");
-        self.emit("ret_empty:");
-        self.emit("  ret ptr %out");
-        self.emit("ret_result:");
-        self.emit("  ret ptr %result");
+        self.emit("  ret ptr %buf");
         self.emit("}");
         self.emit("");
     }
@@ -384,6 +409,10 @@ impl Codegen {
 
         let ret_llvm = Self::llvm_ty(&f.ret_ty.to_type());
 
+        // Emit hw placement metadata as IR comment on the function
+        if let Some(hw) = &f.hw {
+            self.emit(&format!("  {}", hw.ir_comment()));
+        }
         self.emit(&format!("define {} @{}({}) {{", ret_llvm, f.name, params_ir.join(", ")));
         self.emit("entry:");
 
@@ -413,8 +442,9 @@ impl Codegen {
         self.label = 0;
         self.slot_id = 0;
         self.current_fn_ret = Type::Void;
-        self.emit("define i32 @main() {");
+        self.emit("define i32 @main(i32 %_argc, ptr %_argv) {");
         self.emit("entry:");
+        self.emit("  call void @ionic_runtime_init(i32 %_argc, ptr %_argv)");
         for stmt in stmts {
             self.emit_stmt(stmt);
         }
@@ -427,7 +457,7 @@ impl Codegen {
 
     fn emit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { mutable: _, name, ty, init } => {
+            Stmt::Let { mutable: _, name, ty, init, hw: _ } => {
                 let (val, vty) = self.emit_expr(init);
                 let resolved = ty.as_ref().map(|t| t.to_type()).unwrap_or_else(|| vty.clone());
                 let llty = Self::llvm_ty(&resolved);
@@ -744,6 +774,24 @@ impl Codegen {
                         self.emit(&format!("  {} = call i64 @strlen(ptr {})", r, obj_val));
                         (r, Type::Int64)
                     }
+                    (Type::Model(hw), "forward") => {
+                        let (tensor_v, _) = arg_vals.into_iter().next()
+                            .unwrap_or_else(|| ("null".to_string(), Type::Unknown));
+                        let r = self.fresh_reg();
+                        self.emit(&format!(
+                            "  {} = call ptr @ionic_model_forward(ptr {}, ptr {})",
+                            r, obj_val, tensor_v
+                        ));
+                        (r, Type::Tensor(hw.clone()))
+                    }
+                    (Type::Model(_), "to_gpu") => {
+                        self.emit("  ; model.to_gpu() — stub: Phase 1 returns same handle");
+                        (obj_val, Type::Model(Box::new(HwTarget::Gpu)))
+                    }
+                    (Type::Model(_), "to_cpu") => {
+                        self.emit("  ; model.to_cpu() — stub");
+                        (obj_val, Type::Model(Box::new(HwTarget::Cpu)))
+                    }
                     _ => {
                         // Generic dispatch
                         let r = self.fresh_reg();
@@ -953,6 +1001,33 @@ impl Codegen {
                 let r = self.fresh_reg();
                 self.emit(&format!("  {} = call ptr @ionic_char_to_str(i64 {})", r, v));
                 (r, Type::Str)
+            }
+            "get_arg" => {
+                let (idx, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_get_arg(i64 {})", r, idx));
+                (r, Type::Str)
+            }
+            "cpu_core_count" => {
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call i64 @ionic_cpu_core_count()", r));
+                (r, Type::Int64)
+            }
+            "file_exists" => {
+                let (path, _) = &args[0];
+                let r32 = self.fresh_reg();
+                self.emit(&format!("  {} = call i32 @access(ptr {}, i32 0)", r32, path));
+                let cmp = self.fresh_reg();
+                self.emit(&format!("  {} = icmp eq i32 {}, 0", cmp, r32));
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = zext i1 {} to i64", r, cmp));
+                (r, Type::Int64)
+            }
+            "load_model" => {
+                let (v, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_load_model(ptr {})", r, v));
+                (r, Type::Model(Box::new(HwTarget::Cpu)))
             }
             "file_read" => {
                 let (v, _) = &args[0];

@@ -62,15 +62,68 @@ impl Parser {
         let mut top_level = Vec::new();
 
         while *self.peek() != Token::EOF {
+            // Hardware annotation may prefix struct/fn/let/mut at any level
+            let hw = self.parse_hw_annotation()?;
             match self.peek().clone() {
-                Token::Import => imports.push(self.parse_import()?),
-                Token::Struct => structs.push(self.parse_struct()?),
-                Token::Fn     => fns.push(self.parse_fn()?),
-                _             => top_level.push(self.parse_stmt()?),
+                Token::Import => {
+                    imports.push(self.parse_import()?);
+                }
+                Token::Struct => {
+                    let mut sd = self.parse_struct()?;
+                    sd.hw = hw;
+                    structs.push(sd);
+                }
+                Token::Fn => {
+                    let mut fd = self.parse_fn()?;
+                    fd.hw = hw;
+                    fns.push(fd);
+                }
+                _ => {
+                    top_level.push(self.parse_stmt_hw(hw)?);
+                }
             }
         }
 
         Ok(Program { imports, structs, fns, top_level })
+    }
+
+    // ── Hardware annotation ───────────────────────────────────────────────────
+
+    fn parse_hw_annotation(&mut self) -> Result<Option<HwAnnotation>, String> {
+        let ann = match self.peek().clone() {
+            Token::AtGpu => {
+                self.advance();
+                if *self.peek() == Token::LParen {
+                    self.advance();
+                    let frac = match self.peek().clone() {
+                        Token::FloatLit(f) => { self.advance(); f }
+                        Token::IntLit(n)   => { self.advance(); n as f64 }
+                        t => return Err(format!("Line {}: expected fraction in @gpu(...), got `{}`", self.line(), t)),
+                    };
+                    self.expect(&Token::RParen)?;
+                    HwAnnotation::GpuFrac(frac)
+                } else {
+                    HwAnnotation::Gpu
+                }
+            }
+            Token::AtCpu => {
+                self.advance();
+                if *self.peek() == Token::LParen {
+                    self.advance();
+                    let frac = match self.peek().clone() {
+                        Token::FloatLit(f) => { self.advance(); f }
+                        Token::IntLit(n)   => { self.advance(); n as f64 }
+                        t => return Err(format!("Line {}: expected fraction in @cpu(...), got `{}`", self.line(), t)),
+                    };
+                    self.expect(&Token::RParen)?;
+                    HwAnnotation::CpuFrac(frac)
+                } else {
+                    HwAnnotation::Cpu
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(ann))
     }
 
     // ── Import ────────────────────────────────────────────────────────────────
@@ -103,7 +156,7 @@ impl Parser {
             }
         }
         self.expect(&Token::RBrace)?;
-        Ok(StructDef { name, fields })
+        Ok(StructDef { name, fields, hw: None })
     }
 
     // ── Function definition ───────────────────────────────────────────────────
@@ -116,9 +169,11 @@ impl Parser {
 
         let mut params = Vec::new();
         while *self.peek() != Token::RParen && *self.peek() != Token::EOF {
+            // optional @gpu/@cpu annotation on parameter
+            let phw = self.parse_hw_annotation()?;
             let ty = self.parse_type_annotation()?;
             let pname = self.expect_ident()?;
-            params.push(Param { name: pname, ty });
+            params.push(Param { name: pname, ty, hw: phw });
             if *self.peek() == Token::Comma { self.advance(); }
         }
         self.expect(&Token::RParen)?;
@@ -131,7 +186,7 @@ impl Parser {
         };
 
         let body = self.parse_block()?;
-        Ok(FnDef { name, params, ret_ty, body, line })
+        Ok(FnDef { name, params, ret_ty, body, line, hw: None })
     }
 
     // ── Type annotation ───────────────────────────────────────────────────────
@@ -151,6 +206,15 @@ impl Parser {
                     _ => None,
                 };
                 Ok(TypeAnnotation::Tensor(hw))
+            }
+            Token::KwModel => {
+                self.advance();
+                let hw = match self.peek() {
+                    Token::AtGpu => { self.advance(); Some(HwTarget::Gpu) }
+                    Token::AtCpu => { self.advance(); Some(HwTarget::Cpu) }
+                    _ => None,
+                };
+                Ok(TypeAnnotation::Model(hw))
             }
             Token::LBracket => {
                 self.advance();
@@ -181,9 +245,19 @@ impl Parser {
     // ── Statements ────────────────────────────────────────────────────────────
 
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
+        self.parse_stmt_hw(None)
+    }
+
+    fn parse_stmt_hw(&mut self, hw: Option<HwAnnotation>) -> Result<Stmt, String> {
+        // Allow @gpu/@cpu inside blocks too (e.g., @gpu let x = ...)
+        let hw = if hw.is_some() {
+            hw
+        } else {
+            self.parse_hw_annotation()?
+        };
         match self.peek().clone() {
-            Token::Let => self.parse_let(false),
-            Token::Mut => self.parse_let(true),
+            Token::Let => self.parse_let(false, hw),
+            Token::Mut => self.parse_let(true, hw),
 
             Token::Return => {
                 self.advance();
@@ -315,7 +389,7 @@ impl Parser {
         Ok(base)
     }
 
-    fn parse_let(&mut self, mutable: bool) -> Result<Stmt, String> {
+    fn parse_let(&mut self, mutable: bool, hw: Option<HwAnnotation>) -> Result<Stmt, String> {
         self.advance(); // `let` or `mut`
         let name = self.expect_ident()?;
         let ty = if *self.peek() == Token::Colon {
@@ -327,7 +401,7 @@ impl Parser {
         self.expect(&Token::Eq)?;
         let init = self.parse_expr()?;
         self.expect(&Token::Semicolon)?;
-        Ok(Stmt::Let { mutable, name, ty, init })
+        Ok(Stmt::Let { mutable, name, ty, init, hw })
     }
 
     fn parse_if(&mut self) -> Result<Stmt, String> {

@@ -26,6 +26,7 @@ pub enum Token {
     KwBool,
     KwString,
     KwTensor,
+    KwModel,
     KwVoid,
     // Hardware annotations
     AtGpu,
@@ -97,7 +98,8 @@ impl fmt::Display for Token {
             Token::KwBool => write!(f, "bool"),
             Token::KwString => write!(f, "string"),
             Token::KwTensor => write!(f, "tensor"),
-            Token::KwVoid => write!(f, "void"),
+            Token::KwModel  => write!(f, "model"),
+            Token::KwVoid   => write!(f, "void"),
             Token::AtGpu => write!(f, "@gpu"),
             Token::AtCpu => write!(f, "@cpu"),
             Token::IntLit(n) => write!(f, "{}", n),
@@ -291,7 +293,8 @@ impl Lexer {
                 "bool" => Token::KwBool,
                 "string" => Token::KwString,
                 "tensor" => Token::KwTensor,
-                "void" => Token::KwVoid,
+                "model"  => Token::KwModel,
+                "void"   => Token::KwVoid,
                 _ => Token::Ident(ident),
             };
             return Ok(self.spanned(tok, line, col));
