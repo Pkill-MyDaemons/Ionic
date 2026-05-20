@@ -1,0 +1,57 @@
+// AIL Language Showcase
+// Statically typed, zero-overhead, hardware-aware
+
+// ── Type inference ────────────────────────────────────────────────
+let greeting = "AIL v0.1.0 — Java style, C speed";
+print(greeting);
+
+// ── Explicit types ────────────────────────────────────────────────
+let pi: float64 = 3.14159265358979;
+let n:  int64   = 1000000;
+
+// ── Arithmetic ────────────────────────────────────────────────────
+let circumference = 2.0 * pi * 5.0;
+print(circumference);
+
+// ── Mutable variables ─────────────────────────────────────────────
+mut sum = 0;
+for (i in 0..100) {
+    sum = sum + i;
+}
+print(sum);   // 0+1+...+99 = 4950
+
+// ── Recursion ─────────────────────────────────────────────────────
+fn power(int64 base, int64 exp) -> int64 {
+    if (exp == 0) { return 1; }
+    return base * power(base, exp - 1);
+}
+
+let p = power(2, 16);
+print(p);   // 65536
+
+// ── Higher-order logic ────────────────────────────────────────────
+fn is_prime(int64 n) -> bool {
+    if (n < 2) { return false; }
+    mut i = 2;
+    while (i * i <= n) {
+        if (n - (n / i) * i == 0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+mut prime_count = 0;
+for (k in 2..100) {
+    if (is_prime(k)) {
+        prime_count = prime_count + 1;
+    }
+}
+print(prime_count);   // 25 primes below 100
+
+// ── Hardware-typed variables (parsed + enforced) ──────────────────
+// let weights: tensor@gpu = ...;
+// let inputs:  tensor@cpu = ...;
+// gpu { let out = forward(inputs.toGpu(), weights); }
+
+let done = "Done.";
+print(done);

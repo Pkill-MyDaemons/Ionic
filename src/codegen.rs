@@ -1,0 +1,1076 @@
+use std::collections::HashMap;
+use crate::ast::*;
+
+/// Struct layout: field names in order (all fields are i64-sized for simplicity in Phase 1)
+#[derive(Debug, Clone)]
+pub struct StructLayout {
+    pub fields: Vec<(String, Type)>, // ordered field list
+}
+
+pub struct Codegen {
+    out: String,
+    reg: usize,
+    slot_id: usize,                                 // unique alloca suffix
+    str_lits: Vec<(String, usize)>,                 // (escaped, raw_byte_count)
+    vars: Vec<HashMap<String, (String, Type)>>,     // name -> (alloca_ptr, type)
+    fns: HashMap<String, (Vec<Type>, Type)>,
+    structs: HashMap<String, StructLayout>,
+    current_fn_ret: Type,
+    label: usize,
+    // Break/continue target label stacks
+    break_labels: Vec<String>,
+    continue_labels: Vec<String>,
+}
+
+impl Codegen {
+    pub fn new() -> Self {
+        Codegen {
+            out: String::new(),
+            reg: 0,
+            slot_id: 0,
+            str_lits: Vec::new(),
+            vars: vec![HashMap::new()],
+            fns: HashMap::new(),
+            structs: HashMap::new(),
+            current_fn_ret: Type::Void,
+            label: 0,
+            break_labels: Vec::new(),
+            continue_labels: Vec::new(),
+        }
+    }
+
+    fn fresh_slot(&mut self, name: &str) -> String {
+        self.slot_id += 1;
+        format!("%{}.s{}", name, self.slot_id)
+    }
+
+    // ── Output ────────────────────────────────────────────────────────────────
+
+    fn emit(&mut self, line: &str) {
+        self.out.push_str(line);
+        self.out.push('\n');
+    }
+
+    fn fresh_reg(&mut self) -> String {
+        self.reg += 1;
+        format!("%r{}", self.reg)
+    }
+
+    fn fresh_label(&mut self) -> String {
+        self.label += 1;
+        format!("lbl{}", self.label)
+    }
+
+    fn intern_str(&mut self, s: &str) -> usize {
+        let escaped = s
+            .replace('\\', "\\5C")
+            .replace('\n', "\\0A")
+            .replace('\t', "\\09")
+            .replace('"', "\\22");
+        let bc = raw_byte_count(&escaped);
+        self.str_lits.push((escaped, bc));
+        self.str_lits.len() - 1
+    }
+
+    // ── Type system ───────────────────────────────────────────────────────────
+
+    fn llvm_ty(ty: &Type) -> &'static str {
+        match ty {
+            Type::Int64 | Type::Bool => "i64",
+            Type::Float64 => "double",
+            Type::Str | Type::Array(_) | Type::Tensor(_) | Type::Struct(_) => "ptr",
+            Type::Void | Type::Unknown => "void",
+        }
+    }
+
+    fn struct_field_offset(layout: &StructLayout, field: &str) -> Option<usize> {
+        layout.fields.iter().position(|(f, _)| f == field)
+    }
+
+    fn struct_size(layout: &StructLayout) -> usize {
+        layout.fields.len() // each field is 8 bytes (i64/ptr)
+    }
+
+    // ── Ptr ↔ i64 coercions for array element storage ────────────────────────
+
+    fn is_ptr_ty(ty: &Type) -> bool {
+        matches!(ty, Type::Str | Type::Array(_) | Type::Struct(_) | Type::Tensor(_))
+    }
+
+    fn ptr_to_i64(&mut self, val: &str, ty: &Type) -> String {
+        if Self::is_ptr_ty(ty) {
+            let r = self.fresh_reg();
+            self.emit(&format!("  {} = ptrtoint ptr {} to i64", r, val));
+            r
+        } else {
+            val.to_string()
+        }
+    }
+
+    fn i64_to_elem(&mut self, val: &str, ty: &Type) -> String {
+        if Self::is_ptr_ty(ty) {
+            let r = self.fresh_reg();
+            self.emit(&format!("  {} = inttoptr i64 {} to ptr", r, val));
+            r
+        } else {
+            val.to_string()
+        }
+    }
+
+    // ── Scope helpers ─────────────────────────────────────────────────────────
+
+    fn push_scope(&mut self) { self.vars.push(HashMap::new()); }
+    fn pop_scope(&mut self)  { self.vars.pop(); }
+
+    fn declare_var(&mut self, name: &str, slot: String, ty: Type) {
+        if let Some(scope) = self.vars.last_mut() {
+            scope.insert(name.to_string(), (slot, ty));
+        }
+    }
+
+    fn lookup_var(&self, name: &str) -> Option<(String, Type)> {
+        for scope in self.vars.iter().rev() {
+            if let Some(v) = scope.get(name) {
+                return Some(v.clone());
+            }
+        }
+        None
+    }
+
+    // ── Public entry ──────────────────────────────────────────────────────────
+
+    pub fn generate(&mut self, program: &Program) -> String {
+        // Register struct layouts
+        for s in &program.structs {
+            let fields: Vec<(String, Type)> = s.fields.iter()
+                .map(|f| (f.name.clone(), f.ty.to_type()))
+                .collect();
+            self.structs.insert(s.name.clone(), StructLayout { fields });
+        }
+
+        // Register function signatures
+        for f in &program.fns {
+            let pt: Vec<Type> = f.params.iter().map(|p| p.ty.to_type()).collect();
+            self.fns.insert(f.name.clone(), (pt, f.ret_ty.to_type()));
+        }
+
+        self.emit("; Ionic compiled output — LLVM 15+ opaque pointers");
+        self.emit("; Generated by ionic v0.1.0");
+        self.emit("");
+
+        // Format string constants
+        self.emit("@fmt_int   = private constant [6 x i8]  c\"%lld\\0A\\00\"");
+        self.emit("@fmt_float = private constant [5 x i8]  c\"%lf\\0A\\00\"");
+        self.emit("@fmt_str   = private constant [4 x i8]  c\"%s\\0A\\00\"");
+        self.emit("@fmt_bool_t = private constant [6 x i8] c\"true\\0A\\00\"");
+        self.emit("@fmt_bool_f = private constant [7 x i8] c\"false\\0A\\00\"");
+        self.emit("");
+
+        // External declarations
+        self.emit("declare i32  @printf(ptr, ...)");
+        self.emit("declare i32  @puts(ptr)");
+        self.emit("declare ptr  @malloc(i64)");
+        self.emit("declare void @free(ptr)");
+        self.emit("declare ptr  @realloc(ptr, i64)");
+        self.emit("declare ptr  @memcpy(ptr, ptr, i64)");
+        self.emit("declare i64  @strlen(ptr)");
+        self.emit("declare ptr  @strcat(ptr, ptr)");
+        self.emit("declare ptr  @strcpy(ptr, ptr)");
+        self.emit("declare i32  @strcmp(ptr, ptr)");
+        self.emit("declare ptr  @strdup(ptr)");
+        self.emit("declare i32  @sprintf(ptr, ptr, ...)");
+        self.emit("declare i32  @snprintf(ptr, i64, ptr, ...)"); // size_t ABI issues; use sprintf where possible
+        self.emit("declare double @sqrt(double)");
+        self.emit("declare double @fabs(double)");
+        self.emit("declare void @exit(i32)");
+        // File I/O
+        self.emit("declare ptr  @fopen(ptr, ptr)");
+        self.emit("declare i32  @fclose(ptr)");
+        self.emit("declare ptr  @fgets(ptr, i32, ptr)");
+        self.emit("declare i32  @fputs(ptr, ptr)");
+        self.emit("declare i32  @feof(ptr)");
+        self.emit("");
+
+        // Emit Ionic runtime helpers
+        self.emit_runtime_helpers();
+
+        // Emit struct type aliases (opaque, all fields are i64)
+        let struct_names: Vec<(String, usize)> = self.structs
+            .iter()
+            .map(|(n, l)| (n.clone(), Self::struct_size(l)))
+            .collect();
+        for (name, size) in &struct_names {
+            // Each field is 8 bytes
+            self.emit(&format!(
+                "; struct {} : {} fields ({} bytes)",
+                name, size, size * 8
+            ));
+        }
+        if !struct_names.is_empty() { self.emit(""); }
+
+        let fns: Vec<FnDef> = program.fns.clone();
+        for f in &fns {
+            self.emit_fn(f);
+        }
+
+        let top: Vec<Stmt> = program.top_level.clone();
+        self.emit_main(&top);
+
+        // Flush interned string literals
+        let lits = self.str_lits.clone();
+        for (i, (escaped, bc)) in lits.iter().enumerate() {
+            self.emit(&format!(
+                "@str{} = private constant [{} x i8] c\"{}\\00\"",
+                i, bc + 1, escaped
+            ));
+        }
+
+        self.out.clone()
+    }
+
+    fn emit_runtime_helpers(&mut self) {
+        // ail_array_new(element_size, capacity) -> ptr
+        // Layout: [len:i64][cap:i64][data...]
+        self.emit("; --- Ionic runtime: dynamic array ---");
+        self.emit("define ptr @ionic_array_new(i64 %elem_size, i64 %cap) {");
+        self.emit("entry:");
+        self.emit("  %header = mul i64 8, 2");
+        self.emit("  %data_size = mul i64 %elem_size, %cap");
+        self.emit("  %total = add i64 %header, %data_size");
+        self.emit("  %buf = call ptr @malloc(i64 %total)");
+        self.emit("  store i64 0, ptr %buf, align 8");
+        self.emit("  %cap_ptr = getelementptr i64, ptr %buf, i64 1");
+        self.emit("  store i64 %cap, ptr %cap_ptr, align 8");
+        self.emit("  ret ptr %buf");
+        self.emit("}");
+        self.emit("");
+
+        // ail_array_len(arr) -> i64
+        self.emit("define i64 @ionic_array_len(ptr %arr) {");
+        self.emit("entry:");
+        self.emit("  %len = load i64, ptr %arr, align 8");
+        self.emit("  ret i64 %len");
+        self.emit("}");
+        self.emit("");
+
+        // ail_array_get(arr, idx) -> i64  (all elements treated as i64/ptr)
+        self.emit("define i64 @ionic_array_get(ptr %arr, i64 %idx) {");
+        self.emit("entry:");
+        self.emit("  %data = getelementptr i64, ptr %arr, i64 2");
+        self.emit("  %elem_ptr = getelementptr i64, ptr %data, i64 %idx");
+        self.emit("  %val = load i64, ptr %elem_ptr, align 8");
+        self.emit("  ret i64 %val");
+        self.emit("}");
+        self.emit("");
+
+        // ail_array_set(arr, idx, val)
+        self.emit("define void @ionic_array_set(ptr %arr, i64 %idx, i64 %val) {");
+        self.emit("entry:");
+        self.emit("  %data = getelementptr i64, ptr %arr, i64 2");
+        self.emit("  %elem_ptr = getelementptr i64, ptr %data, i64 %idx");
+        self.emit("  store i64 %val, ptr %elem_ptr, align 8");
+        self.emit("  ret void");
+        self.emit("}");
+        self.emit("");
+
+        // ail_array_push(arr, val) — grows if needed
+        self.emit("define void @ionic_array_push(ptr %arr, i64 %val) {");
+        self.emit("entry:");
+        self.emit("  %len = load i64, ptr %arr, align 8");
+        self.emit("  %cap_ptr = getelementptr i64, ptr %arr, i64 1");
+        self.emit("  %cap = load i64, ptr %cap_ptr, align 8");
+        self.emit("  %data = getelementptr i64, ptr %arr, i64 2");
+        self.emit("  %elem_ptr = getelementptr i64, ptr %data, i64 %len");
+        self.emit("  store i64 %val, ptr %elem_ptr, align 8");
+        self.emit("  %new_len = add i64 %len, 1");
+        self.emit("  store i64 %new_len, ptr %arr, align 8");
+        self.emit("  ret void");
+        self.emit("}");
+        self.emit("");
+
+        // ail_str_concat(a, b) -> ptr
+        self.emit("define ptr @ionic_str_concat(ptr %a, ptr %b) {");
+        self.emit("entry:");
+        self.emit("  %la = call i64 @strlen(ptr %a)");
+        self.emit("  %lb = call i64 @strlen(ptr %b)");
+        self.emit("  %tot1 = add i64 %la, %lb");
+        self.emit("  %tot = add i64 %tot1, 1");
+        self.emit("  %buf = call ptr @malloc(i64 %tot)");
+        self.emit("  call ptr @strcpy(ptr %buf, ptr %a)");
+        self.emit("  call ptr @strcat(ptr %buf, ptr %b)");
+        self.emit("  ret ptr %buf");
+        self.emit("}");
+        self.emit("");
+
+        // ail_int64_to_str(n) -> ptr
+        self.emit("@fmt_lld = private constant [5 x i8] c\"%lld\\00\"");
+        self.emit("define ptr @ionic_int64_to_str(i64 %n) {");
+        self.emit("entry:");
+        self.emit("  %buf = call ptr @malloc(i64 32)");
+        self.emit("  call i32 (ptr, ptr, ...) @sprintf(ptr %buf, ptr @fmt_lld, i64 %n)");
+        self.emit("  ret ptr %buf");
+        self.emit("}");
+        self.emit("");
+
+        // ail_float64_to_str(f) -> ptr
+        self.emit("@fmt_lf = private constant [4 x i8] c\"%lf\\00\"");
+        self.emit("define ptr @ionic_float64_to_str(double %f) {");
+        self.emit("entry:");
+        self.emit("  %buf = call ptr @malloc(i64 64)");
+        self.emit("  call i32 (ptr, ptr, ...) @sprintf(ptr %buf, ptr @fmt_lf, double %f)");
+        self.emit("  ret ptr %buf");
+        self.emit("}");
+        self.emit("");
+
+        // ail_char_to_str(c) -> ptr
+        self.emit("define ptr @ionic_char_to_str(i64 %c) {");
+        self.emit("entry:");
+        self.emit("  %buf = call ptr @malloc(i64 2)");
+        self.emit("  %c8 = trunc i64 %c to i8");
+        self.emit("  store i8 %c8, ptr %buf, align 1");
+        self.emit("  %nul_ptr = getelementptr i8, ptr %buf, i64 1");
+        self.emit("  store i8 0, ptr %nul_ptr, align 1");
+        self.emit("  ret ptr %buf");
+        self.emit("}");
+        self.emit("");
+
+        // File I/O wrappers
+        self.emit("@mode_r = private constant [2 x i8] c\"r\\00\"");
+        self.emit("@mode_w = private constant [2 x i8] c\"w\\00\"");
+
+        // file_read(path) -> string (reads entire file)
+        self.emit("define ptr @ionic_file_read(ptr %path) {");
+        self.emit("entry:");
+        self.emit("  %fp = call ptr @fopen(ptr %path, ptr @mode_r)");
+        self.emit("  %buf = call ptr @malloc(i64 65536)");
+        self.emit("  %out = call ptr @malloc(i64 1)");
+        self.emit("  store i8 0, ptr %out, align 1");
+        self.emit("  %len_slot = alloca i64, align 8");
+        self.emit("  store i64 0, ptr %len_slot, align 8");
+        self.emit("  br label %read_loop");
+        self.emit("read_loop:");
+        self.emit("  %line = call ptr @fgets(ptr %buf, i32 65536, ptr %fp)");
+        self.emit("  %is_null = icmp eq ptr %line, null");
+        self.emit("  br i1 %is_null, label %read_done, label %read_body");
+        self.emit("read_body:");
+        self.emit("  %new_out = call ptr @ionic_str_concat(ptr %out, ptr %buf)");
+        self.emit("  store ptr %new_out, ptr %len_slot, align 8");
+        self.emit("  br label %read_loop");
+        self.emit("read_done:");
+        self.emit("  call i32 @fclose(ptr %fp)");
+        self.emit("  %result = load ptr, ptr %len_slot, align 8");
+        self.emit("  %is_empty = icmp eq ptr %result, null");
+        self.emit("  br i1 %is_empty, label %ret_empty, label %ret_result");
+        self.emit("ret_empty:");
+        self.emit("  ret ptr %out");
+        self.emit("ret_result:");
+        self.emit("  ret ptr %result");
+        self.emit("}");
+        self.emit("");
+    }
+
+    fn emit_fn(&mut self, f: &FnDef) {
+        self.reg = 0;
+        self.label = 0;
+        self.slot_id = 0;
+        self.push_scope();
+        self.current_fn_ret = f.ret_ty.to_type();
+
+        let params_ir: Vec<String> = f.params.iter().map(|p| {
+            let llty = Self::llvm_ty(&p.ty.to_type());
+            // Bool params come in as i64 at the boundary for simplicity
+            format!("{} %{}", llty, p.name)
+        }).collect();
+
+        let ret_llvm = Self::llvm_ty(&f.ret_ty.to_type());
+
+        self.emit(&format!("define {} @{}({}) {{", ret_llvm, f.name, params_ir.join(", ")));
+        self.emit("entry:");
+
+        for p in &f.params {
+            let ty = p.ty.to_type();
+            let llty = Self::llvm_ty(&ty);
+            let slot = self.fresh_slot(&p.name);
+            self.emit(&format!("  {} = alloca {}, align 8", slot, llty));
+            self.emit(&format!("  store {} %{}, ptr {}, align 8", llty, p.name, slot));
+            self.declare_var(&p.name, slot, ty);
+        }
+
+        for stmt in &f.body.clone() {
+            self.emit_stmt(stmt);
+        }
+
+        if f.ret_ty.to_type() == Type::Void {
+            self.emit("  ret void");
+        }
+        self.emit("}");
+        self.emit("");
+        self.pop_scope();
+    }
+
+    fn emit_main(&mut self, stmts: &[Stmt]) {
+        self.reg = 0;
+        self.label = 0;
+        self.slot_id = 0;
+        self.current_fn_ret = Type::Void;
+        self.emit("define i32 @main() {");
+        self.emit("entry:");
+        for stmt in stmts {
+            self.emit_stmt(stmt);
+        }
+        self.emit("  ret i32 0");
+        self.emit("}");
+        self.emit("");
+    }
+
+    // ── Statement codegen ─────────────────────────────────────────────────────
+
+    fn emit_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let { mutable: _, name, ty, init } => {
+                let (val, vty) = self.emit_expr(init);
+                let resolved = ty.as_ref().map(|t| t.to_type()).unwrap_or_else(|| vty.clone());
+                let llty = Self::llvm_ty(&resolved);
+                let slot = self.fresh_slot(name);
+                self.emit(&format!("  {} = alloca {}, align 8", slot, llty));
+                self.emit(&format!("  store {} {}, ptr {}, align 8", llty, val, slot));
+                self.declare_var(name, slot, resolved);
+            }
+
+            Stmt::Assign { target, value } => {
+                let (val, vty) = self.emit_expr(value);
+                let llty = Self::llvm_ty(&vty);
+                match target {
+                    AssignTarget::Ident(name) => {
+                        if let Some((slot, _)) = self.lookup_var(name) {
+                            self.emit(&format!("  store {} {}, ptr {}, align 8", llty, val, slot));
+                        }
+                    }
+                    AssignTarget::Field(obj, field) => {
+                        let (obj_val, obj_ty) = self.emit_expr(obj);
+                        if let Type::Struct(sname) = &obj_ty {
+                            if let Some(layout) = self.structs.get(sname).cloned() {
+                                if let Some(idx) = Self::struct_field_offset(&layout, field) {
+                                    let gep = self.fresh_reg();
+                                    self.emit(&format!(
+                                        "  {} = getelementptr i64, ptr {}, i64 {}",
+                                        gep, obj_val, idx
+                                    ));
+                                    self.emit(&format!("  store {} {}, ptr {}, align 8", llty, val, gep));
+                                }
+                            }
+                        }
+                    }
+                    AssignTarget::Index(obj, idx) => {
+                        let (obj_val, _) = self.emit_expr(obj);
+                        let (idx_val, _) = self.emit_expr(idx);
+                        let i64_val = self.ptr_to_i64(&val, &vty);
+                        self.emit(&format!(
+                            "  call void @ionic_array_set(ptr {}, i64 {}, i64 {})",
+                            obj_val, idx_val, i64_val
+                        ));
+                    }
+                }
+            }
+
+            Stmt::ExprStmt(e) => { self.emit_expr(e); }
+
+            Stmt::Return(expr) => {
+                if let Some(e) = expr {
+                    let (v, ty) = self.emit_expr(e);
+                    self.emit(&format!("  ret {} {}", Self::llvm_ty(&ty), v));
+                } else {
+                    self.emit("  ret void");
+                }
+            }
+
+            Stmt::If { cond, then_block, else_block } => {
+                let (cond_v, cond_ty) = self.emit_expr(cond);
+                // Condition might be i64 (bool as i64) — truncate to i1
+                let cond_i1 = self.coerce_to_i1(&cond_v, &cond_ty);
+
+                let then_lbl  = self.fresh_label();
+                let merge_lbl = self.fresh_label();
+
+                if else_block.is_some() {
+                    let else_lbl = self.fresh_label();
+                    self.emit(&format!("  br i1 {}, label %{}, label %{}", cond_i1, then_lbl, else_lbl));
+                    self.emit(&format!("{}:", then_lbl));
+                    self.push_scope();
+                    for s in then_block { self.emit_stmt(s); }
+                    self.pop_scope();
+                    self.emit(&format!("  br label %{}", merge_lbl));
+                    self.emit(&format!("{}:", else_lbl));
+                    self.push_scope();
+                    for s in else_block.as_ref().unwrap() { self.emit_stmt(s); }
+                    self.pop_scope();
+                    self.emit(&format!("  br label %{}", merge_lbl));
+                } else {
+                    self.emit(&format!("  br i1 {}, label %{}, label %{}", cond_i1, then_lbl, merge_lbl));
+                    self.emit(&format!("{}:", then_lbl));
+                    self.push_scope();
+                    for s in then_block { self.emit_stmt(s); }
+                    self.pop_scope();
+                    self.emit(&format!("  br label %{}", merge_lbl));
+                }
+                self.emit(&format!("{}:", merge_lbl));
+            }
+
+            Stmt::While { cond, body } => {
+                let cond_lbl = self.fresh_label();
+                let body_lbl = self.fresh_label();
+                let exit_lbl = self.fresh_label();
+
+                self.break_labels.push(exit_lbl.clone());
+                self.continue_labels.push(cond_lbl.clone());
+
+                self.emit(&format!("  br label %{}", cond_lbl));
+                self.emit(&format!("{}:", cond_lbl));
+                let (cv, cty) = self.emit_expr(cond);
+                let ci1 = self.coerce_to_i1(&cv, &cty);
+                self.emit(&format!("  br i1 {}, label %{}, label %{}", ci1, body_lbl, exit_lbl));
+
+                self.emit(&format!("{}:", body_lbl));
+                self.push_scope();
+                for s in body { self.emit_stmt(s); }
+                self.pop_scope();
+                self.emit(&format!("  br label %{}", cond_lbl));
+
+                self.emit(&format!("{}:", exit_lbl));
+                self.break_labels.pop();
+                self.continue_labels.pop();
+            }
+
+            Stmt::For { var, start, end, body } => {
+                let (sv, _) = self.emit_expr(start);
+                let (ev, _) = self.emit_expr(end);
+
+                let slot = self.fresh_slot(var);
+                self.emit(&format!("  {} = alloca i64, align 8", slot));
+                self.emit(&format!("  store i64 {}, ptr {}, align 8", sv, slot));
+
+                let cond_lbl = self.fresh_label();
+                let body_lbl = self.fresh_label();
+                let incr_lbl = self.fresh_label();
+                let exit_lbl = self.fresh_label();
+
+                self.break_labels.push(exit_lbl.clone());
+                self.continue_labels.push(incr_lbl.clone());
+
+                self.emit(&format!("  br label %{}", cond_lbl));
+                self.emit(&format!("{}:", cond_lbl));
+                let cur = self.fresh_reg();
+                self.emit(&format!("  {} = load i64, ptr {}, align 8", cur, slot));
+                let cmp_i1 = self.fresh_reg();
+                let cmp    = self.fresh_reg();
+                self.emit(&format!("  {} = icmp slt i64 {}, {}", cmp_i1, cur, ev));
+                self.emit(&format!("  {} = zext i1 {} to i64", cmp, cmp_i1));
+                let br = self.fresh_reg();
+                self.emit(&format!("  {} = trunc i64 {} to i1", br, cmp));
+                self.emit(&format!("  br i1 {}, label %{}, label %{}", br, body_lbl, exit_lbl));
+
+                self.emit(&format!("{}:", body_lbl));
+                self.push_scope();
+                self.declare_var(var, slot.clone(), Type::Int64);
+                for s in body { self.emit_stmt(s); }
+                self.pop_scope();
+                self.emit(&format!("  br label %{}", incr_lbl));
+
+                self.emit(&format!("{}:", incr_lbl));
+                let cur2 = self.fresh_reg();
+                let inc  = self.fresh_reg();
+                self.emit(&format!("  {} = load i64, ptr {}, align 8", cur2, slot));
+                self.emit(&format!("  {} = add i64 {}, 1", inc, cur2));
+                self.emit(&format!("  store i64 {}, ptr {}, align 8", inc, slot));
+                self.emit(&format!("  br label %{}", cond_lbl));
+
+                self.emit(&format!("{}:", exit_lbl));
+                self.break_labels.pop();
+                self.continue_labels.pop();
+            }
+
+            Stmt::GpuBlock(body) => {
+                self.emit("  ; === gpu block begin ===");
+                self.push_scope();
+                for s in body { self.emit_stmt(s); }
+                self.pop_scope();
+                self.emit("  ; === gpu block end ===");
+            }
+
+            Stmt::Break => {
+                if let Some(lbl) = self.break_labels.last().cloned() {
+                    self.emit(&format!("  br label %{}", lbl));
+                    // Emit a dead block so LLVM doesn't complain about missing terminator
+                    let dead = self.fresh_label();
+                    self.emit(&format!("{}:", dead));
+                }
+            }
+
+            Stmt::Continue => {
+                if let Some(lbl) = self.continue_labels.last().cloned() {
+                    self.emit(&format!("  br label %{}", lbl));
+                    let dead = self.fresh_label();
+                    self.emit(&format!("{}:", dead));
+                }
+            }
+
+            Stmt::Import(_) => {}
+        }
+    }
+
+    // ── Condition coercion ─────────────────────────────────────────────────────
+
+    fn coerce_to_i1(&mut self, val: &str, ty: &Type) -> String {
+        // All bools and ints are uniformly i64; truncate to i1 for branching
+        let r = self.fresh_reg();
+        self.emit(&format!("  {} = trunc i64 {} to i1", r, val));
+        r
+    }
+
+    // ── Expression codegen ─────────────────────────────────────────────────────
+
+    fn emit_expr(&mut self, expr: &Expr) -> (String, Type) {
+        match expr {
+            Expr::IntLit(n)    => (n.to_string(), Type::Int64),
+            Expr::FloatLit(f)  => (format!("{:.17}", f), Type::Float64),
+            Expr::BoolLit(b)   => (if *b { "1" } else { "0" }.to_string(), Type::Int64),
+
+            Expr::StringLit(s) => {
+                let idx = self.intern_str(s);
+                let bc  = self.str_lits[idx].1;
+                let reg = self.fresh_reg();
+                self.emit(&format!(
+                    "  {} = getelementptr [{} x i8], ptr @str{}, i32 0, i32 0",
+                    reg, bc + 1, idx
+                ));
+                (reg, Type::Str)
+            }
+
+            Expr::Ident(name) => {
+                if let Some((slot, ty)) = self.lookup_var(name) {
+                    let llty = Self::llvm_ty(&ty);
+                    if llty == "void" {
+                        return ("0".to_string(), Type::Unknown);
+                    }
+                    let reg = self.fresh_reg();
+                    self.emit(&format!("  {} = load {}, ptr {}, align 8", reg, llty, slot));
+                    (reg, ty)
+                } else {
+                    (format!("0 ; undef:{}", name), Type::Unknown)
+                }
+            }
+
+            Expr::BinOp { op, lhs, rhs } => {
+                let (lv, lt) = self.emit_expr(lhs);
+                let (rv, _rt) = self.emit_expr(rhs);
+                let reg = self.fresh_reg();
+                let is_float = lt == Type::Float64;
+                let llty = Self::llvm_ty(&lt);
+
+                let (instr, out_ty) = match op {
+                    BinOp::Add   => (if is_float { format!("fadd {} {}, {}", llty, lv, rv) } else { format!("add {} {}, {}", llty, lv, rv) }, lt.clone()),
+                    BinOp::Sub   => (if is_float { format!("fsub {} {}, {}", llty, lv, rv) } else { format!("sub {} {}, {}", llty, lv, rv) }, lt.clone()),
+                    BinOp::Mul   => (if is_float { format!("fmul {} {}, {}", llty, lv, rv) } else { format!("mul {} {}, {}", llty, lv, rv) }, lt.clone()),
+                    BinOp::Div   => (if is_float { format!("fdiv {} {}, {}", llty, lv, rv) } else { format!("sdiv {} {}, {}", llty, lv, rv) }, lt.clone()),
+                    BinOp::Mod   => (if is_float { format!("frem {} {}, {}", llty, lv, rv) } else { format!("srem {} {}, {}", llty, lv, rv) }, lt.clone()),
+                    // Comparisons: emit icmp (returns i1), then zext to i64
+                    BinOp::EqEq  | BinOp::NotEq |
+                    BinOp::Lt    | BinOp::Gt    |
+                    BinOp::LtEq  | BinOp::GtEq  => {
+                        let cmp_instr = match op {
+                            BinOp::EqEq  => if is_float { format!("fcmp oeq {} {}, {}", llty, lv, rv) } else { format!("icmp eq {} {}, {}", llty, lv, rv) },
+                            BinOp::NotEq => if is_float { format!("fcmp une {} {}, {}", llty, lv, rv) } else { format!("icmp ne {} {}, {}", llty, lv, rv) },
+                            BinOp::Lt    => if is_float { format!("fcmp olt {} {}, {}", llty, lv, rv) } else { format!("icmp slt {} {}, {}", llty, lv, rv) },
+                            BinOp::Gt    => if is_float { format!("fcmp ogt {} {}, {}", llty, lv, rv) } else { format!("icmp sgt {} {}, {}", llty, lv, rv) },
+                            BinOp::LtEq  => if is_float { format!("fcmp ole {} {}, {}", llty, lv, rv) } else { format!("icmp sle {} {}, {}", llty, lv, rv) },
+                            BinOp::GtEq  => if is_float { format!("fcmp oge {} {}, {}", llty, lv, rv) } else { format!("icmp sge {} {}, {}", llty, lv, rv) },
+                            _ => unreachable!(),
+                        };
+                        // i1 result -> zext to i64 so everything stays uniformly i64
+                        let i1_reg = self.fresh_reg();
+                        self.emit(&format!("  {} = {}", i1_reg, cmp_instr));
+                        self.emit(&format!("  {} = zext i1 {} to i64", reg, i1_reg));
+                        return (reg, Type::Int64);
+                    }
+                    BinOp::And   => (format!("and i64 {}, {}", lv, rv), Type::Int64),
+                    BinOp::Or    => (format!("or i64 {}, {}", lv, rv), Type::Int64),
+                    _ => unreachable!(),
+                };
+                self.emit(&format!("  {} = {}", reg, instr));
+                (reg, out_ty)
+            }
+
+            Expr::UnOp { op, expr } => {
+                let (v, ty) = self.emit_expr(expr);
+                let reg = self.fresh_reg();
+                match op {
+                    UnOp::Neg => {
+                        if ty == Type::Float64 {
+                            self.emit(&format!("  {} = fneg double {}", reg, v));
+                        } else {
+                            self.emit(&format!("  {} = sub i64 0, {}", reg, v));
+                        }
+                        (reg, ty)
+                    }
+                    UnOp::Not => {
+                        self.emit(&format!("  {} = xor i64 {}, 1", reg, v));
+                        (reg, Type::Int64)
+                    }
+                }
+            }
+
+            Expr::Call { callee, args } => {
+                let arg_vals: Vec<(String, Type)> = args.iter().map(|a| self.emit_expr(a)).collect();
+                self.emit_call(callee, &arg_vals)
+            }
+
+            Expr::MethodCall { obj, method, args } => {
+                let (obj_val, obj_ty) = self.emit_expr(obj);
+                let arg_vals: Vec<(String, Type)> = args.iter().map(|a| self.emit_expr(a)).collect();
+                match (&obj_ty, method.as_str()) {
+                    (Type::Array(_), "len") => {
+                        let r = self.fresh_reg();
+                        self.emit(&format!("  {} = call i64 @ionic_array_len(ptr {})", r, obj_val));
+                        (r, Type::Int64)
+                    }
+                    (Type::Array(_), "push") => {
+                        let (v, vt) = arg_vals[0].clone();
+                        let i64_v = self.ptr_to_i64(&v, &vt);
+                        self.emit(&format!("  call void @ionic_array_push(ptr {}, i64 {})", obj_val, i64_v));
+                        ("0".to_string(), Type::Void)
+                    }
+                    (Type::Str, "len") => {
+                        let r = self.fresh_reg();
+                        self.emit(&format!("  {} = call i64 @strlen(ptr {})", r, obj_val));
+                        (r, Type::Int64)
+                    }
+                    _ => {
+                        // Generic dispatch
+                        let r = self.fresh_reg();
+                        self.emit(&format!("  {} = add i64 0, 0 ; stub method .{}", r, method));
+                        (r, Type::Int64)
+                    }
+                }
+            }
+
+            Expr::StructLit { name, fields } => {
+                let layout = self.structs.get(name).cloned();
+                if let Some(layout) = layout {
+                    let size = Self::struct_size(&layout);
+                    let byte_size = (size * 8) as i64;
+                    let ptr = self.fresh_reg();
+                    self.emit(&format!("  {} = call ptr @malloc(i64 {})", ptr, byte_size));
+                    // Store each field
+                    for (fname, val_expr) in fields {
+                        let (val, vty) = self.emit_expr(val_expr);
+                        if let Some(idx) = Self::struct_field_offset(&layout, fname) {
+                            let gep = self.fresh_reg();
+                            let llty = Self::llvm_ty(&vty);
+                            self.emit(&format!(
+                                "  {} = getelementptr i64, ptr {}, i64 {}",
+                                gep, ptr, idx
+                            ));
+                            self.emit(&format!("  store {} {}, ptr {}, align 8", llty, val, gep));
+                        }
+                    }
+                    (ptr, Type::Struct(name.clone()))
+                } else {
+                    ("null".to_string(), Type::Unknown)
+                }
+            }
+
+            Expr::FieldAccess { obj, field } => {
+                let (obj_val, obj_ty) = self.emit_expr(obj);
+                if let Type::Struct(sname) = &obj_ty {
+                    if let Some(layout) = self.structs.get(sname).cloned() {
+                        if let Some(idx) = Self::struct_field_offset(&layout, field) {
+                            let field_ty = layout.fields[idx].1.clone();
+                            let llty = Self::llvm_ty(&field_ty);
+                            let gep = self.fresh_reg();
+                            let reg = self.fresh_reg();
+                            self.emit(&format!(
+                                "  {} = getelementptr i64, ptr {}, i64 {}",
+                                gep, obj_val, idx
+                            ));
+                            self.emit(&format!("  {} = load {}, ptr {}, align 8", reg, llty, gep));
+                            return (reg, field_ty);
+                        }
+                    }
+                }
+                ("0".to_string(), Type::Unknown)
+            }
+
+            Expr::Index { obj, idx } => {
+                let (obj_val, obj_ty) = self.emit_expr(obj);
+                let (idx_val, _)      = self.emit_expr(idx);
+                let elem_ty = match &obj_ty {
+                    Type::Array(inner) => *inner.clone(),
+                    Type::Str => Type::Int64,
+                    _ => Type::Unknown,
+                };
+                let raw = self.fresh_reg();
+                self.emit(&format!(
+                    "  {} = call i64 @ionic_array_get(ptr {}, i64 {})",
+                    raw, obj_val, idx_val
+                ));
+                let reg = self.i64_to_elem(&raw, &elem_ty);
+                (reg, elem_ty)
+            }
+
+            Expr::ArrayLit(elems) => {
+                let cap = elems.len().max(8) as i64;
+                let ptr = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_array_new(i64 8, i64 {})", ptr, cap));
+                let mut elem_ty = Type::Unknown;
+                for elem in elems {
+                    let (v, ty) = self.emit_expr(elem);
+                    if matches!(elem_ty, Type::Unknown) { elem_ty = ty.clone(); }
+                    let i64_v = self.ptr_to_i64(&v, &ty);
+                    self.emit(&format!("  call void @ionic_array_push(ptr {}, i64 {})", ptr, i64_v));
+                }
+                (ptr, Type::Array(Box::new(elem_ty)))
+            }
+
+            Expr::ToGpu(inner) => {
+                let (reg, _) = self.emit_expr(inner);
+                self.emit("  ; .toGpu() — Phase 1 stub");
+                (reg, Type::Tensor(Box::new(HwTarget::Gpu)))
+            }
+
+            Expr::ToCpu(inner) => {
+                let (reg, _) = self.emit_expr(inner);
+                self.emit("  ; .toCpu() — Phase 1 stub");
+                (reg, Type::Tensor(Box::new(HwTarget::Cpu)))
+            }
+        }
+    }
+
+    fn emit_call(&mut self, callee: &str, args: &[(String, Type)]) -> (String, Type) {
+        match callee {
+            "print" | "println" => {
+                for (val, ty) in args {
+                    self.emit_print_val(val, ty);
+                }
+                ("0".to_string(), Type::Void)
+            }
+            "exit" => {
+                let (v, _) = &args[0];
+                let t = self.fresh_reg();
+                self.emit(&format!("  {} = trunc i64 {} to i32", t, v));
+                self.emit(&format!("  call void @exit(i32 {})", t));
+                ("0".to_string(), Type::Void)
+            }
+            "sqrt" => {
+                let (v, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call double @sqrt(double {})", r, v));
+                (r, Type::Float64)
+            }
+            "abs" => {
+                let (v, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call double @fabs(double {})", r, v));
+                (r, Type::Float64)
+            }
+            "int64_to_float64" => {
+                let (v, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = sitofp i64 {} to double", r, v));
+                (r, Type::Float64)
+            }
+            "float64_to_int64" => {
+                let (v, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = fptosi double {} to i64", r, v));
+                (r, Type::Int64)
+            }
+            "len" => {
+                let (v, ty) = &args[0];
+                let r = self.fresh_reg();
+                match ty {
+                    Type::Array(_) => self.emit(&format!("  {} = call i64 @ionic_array_len(ptr {})", r, v)),
+                    Type::Str      => self.emit(&format!("  {} = call i64 @strlen(ptr {})", r, v)),
+                    _ => self.emit(&format!("  {} = add i64 0, 0 ; len unsupported type", r)),
+                }
+                (r, Type::Int64)
+            }
+            "push" => {
+                let (arr, _) = args[0].clone();
+                let (val, vt) = args[1].clone();
+                let i64_val = self.ptr_to_i64(&val, &vt);
+                self.emit(&format!("  call void @ionic_array_push(ptr {}, i64 {})", arr, i64_val));
+                ("0".to_string(), Type::Void)
+            }
+            "str_len" => {
+                let (v, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call i64 @strlen(ptr {})", r, v));
+                (r, Type::Int64)
+            }
+            "str_concat" => {
+                let (a, _) = &args[0];
+                let (b, _) = &args[1];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_str_concat(ptr {}, ptr {})", r, a, b));
+                (r, Type::Str)
+            }
+            "str_eq" => {
+                let (a, _) = &args[0];
+                let (b, _) = &args[1];
+                let cmp = self.fresh_reg();
+                let r   = self.fresh_reg();
+                self.emit(&format!("  {} = call i32 @strcmp(ptr {}, ptr {})", cmp, a, b));
+                self.emit(&format!("  {} = icmp eq i32 {}, 0", r, cmp));
+                let ext = self.fresh_reg();
+                self.emit(&format!("  {} = zext i1 {} to i64", ext, r));
+                (ext, Type::Int64)
+            }
+            "str_index" => {
+                let (s, _) = &args[0];
+                let (i, _) = &args[1];
+                let r = self.fresh_reg();
+                let gep = self.fresh_reg();
+                self.emit(&format!("  {} = getelementptr i8, ptr {}, i64 {}", gep, s, i));
+                let byte = self.fresh_reg();
+                self.emit(&format!("  {} = load i8, ptr {}, align 1", byte, gep));
+                self.emit(&format!("  {} = sext i8 {} to i64", r, byte));
+                (r, Type::Int64)
+            }
+            "int64_to_str" => {
+                let (v, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_int64_to_str(i64 {})", r, v));
+                (r, Type::Str)
+            }
+            "float64_to_str" => {
+                let (v, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_float64_to_str(double {})", r, v));
+                (r, Type::Str)
+            }
+            "char_to_str" => {
+                let (v, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_char_to_str(i64 {})", r, v));
+                (r, Type::Str)
+            }
+            "file_read" => {
+                let (v, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_file_read(ptr {})", r, v));
+                (r, Type::Str)
+            }
+            "file_write" => {
+                let (path, _) = &args[0];
+                let (content, _) = &args[1];
+                let fp = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @fopen(ptr {}, ptr @mode_w)", fp, path));
+                self.emit(&format!("  call i32 @fputs(ptr {}, ptr {})", content, fp));
+                self.emit(&format!("  call i32 @fclose(ptr {})", fp));
+                ("1".to_string(), Type::Int64)
+            }
+            "file_open_read" => {
+                let (path, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @fopen(ptr {}, ptr @mode_r)", r, path));
+                // Store ptr as i64 via ptrtoint
+                let ri = self.fresh_reg();
+                self.emit(&format!("  {} = ptrtoint ptr {} to i64", ri, r));
+                (ri, Type::Int64)
+            }
+            "file_open_write" => {
+                let (path, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @fopen(ptr {}, ptr @mode_w)", r, path));
+                let ri = self.fresh_reg();
+                self.emit(&format!("  {} = ptrtoint ptr {} to i64", ri, r));
+                (ri, Type::Int64)
+            }
+            "file_close" => {
+                let (fd, _) = &args[0];
+                let fp = self.fresh_reg();
+                self.emit(&format!("  {} = inttoptr i64 {} to ptr", fp, fd));
+                self.emit(&format!("  call i32 @fclose(ptr {})", fp));
+                ("0".to_string(), Type::Void)
+            }
+            "file_read_line" => {
+                let (fd, _) = &args[0];
+                let fp = self.fresh_reg();
+                self.emit(&format!("  {} = inttoptr i64 {} to ptr", fp, fd));
+                let buf = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @malloc(i64 4096)", buf));
+                let ret = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @fgets(ptr {}, i32 4096, ptr {})", ret, buf, fp));
+                (buf, Type::Str)
+            }
+            "file_write_line" => {
+                let (fd, _)   = &args[0];
+                let (line, _) = &args[1];
+                let fp = self.fresh_reg();
+                self.emit(&format!("  {} = inttoptr i64 {} to ptr", fp, fd));
+                self.emit(&format!("  call i32 @fputs(ptr {}, ptr {})", line, fp));
+                ("0".to_string(), Type::Void)
+            }
+            "file_eof" => {
+                let (fd, _) = &args[0];
+                let fp = self.fresh_reg();
+                self.emit(&format!("  {} = inttoptr i64 {} to ptr", fp, fd));
+                let r32 = self.fresh_reg();
+                self.emit(&format!("  {} = call i32 @feof(ptr {})", r32, fp));
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = sext i32 {} to i64", r, r32));
+                (r, Type::Int64)
+            }
+            other => {
+                // User-defined function
+                let ret_ty = self.fns.get(other).map(|(_, r)| r.clone()).unwrap_or(Type::Void);
+                let llret  = Self::llvm_ty(&ret_ty).to_string();
+                let args_ir: Vec<String> = args.iter().map(|(v, t)| {
+                    format!("{} {}", Self::llvm_ty(t), v)
+                }).collect();
+                if ret_ty == Type::Void {
+                    self.emit(&format!("  call void @{}({})", other, args_ir.join(", ")));
+                    ("0".to_string(), Type::Void)
+                } else {
+                    let r = self.fresh_reg();
+                    self.emit(&format!("  {} = call {} @{}({})", r, llret, other, args_ir.join(", ")));
+                    (r, ret_ty)
+                }
+            }
+        }
+    }
+
+    fn emit_print_val(&mut self, val: &str, ty: &Type) {
+        match ty {
+            Type::Int64 => {
+                self.emit(&format!("  call i32 (ptr, ...) @printf(ptr @fmt_int, i64 {})", val));
+            }
+            Type::Float64 => {
+                self.emit(&format!("  call i32 (ptr, ...) @printf(ptr @fmt_float, double {})", val));
+            }
+            Type::Str => {
+                self.emit(&format!("  call i32 (ptr, ...) @printf(ptr @fmt_str, ptr {})", val));
+            }
+            _ => {
+                // Treat as i64 fallback
+                self.emit(&format!("  call i32 (ptr, ...) @printf(ptr @fmt_int, i64 {})", val));
+            }
+        }
+    }
+}
+
+fn raw_byte_count(escaped: &str) -> usize {
+    let mut count = 0;
+    let bytes = escaped.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 2 < bytes.len() {
+            count += 1;
+            i += 3;
+        } else {
+            count += 1;
+            i += 1;
+        }
+    }
+    count
+}

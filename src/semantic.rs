@@ -1,0 +1,430 @@
+use std::collections::HashMap;
+use crate::ast::*;
+
+#[derive(Debug, Clone)]
+struct VarInfo {
+    ty: Type,
+    mutable: bool,
+}
+
+struct Scope {
+    vars: HashMap<String, VarInfo>,
+}
+
+pub struct SemanticAnalyzer {
+    scopes: Vec<Scope>,
+    functions: HashMap<String, (Vec<Type>, Type)>,
+    structs: HashMap<String, Vec<(String, Type)>>,  // name -> [(field, type)]
+    in_gpu_block: bool,
+    loop_depth: usize,
+    errors: Vec<String>,
+}
+
+impl SemanticAnalyzer {
+    pub fn new() -> Self {
+        let mut sa = SemanticAnalyzer {
+            scopes: vec![Scope { vars: HashMap::new() }],
+            functions: HashMap::new(),
+            structs: HashMap::new(),
+            in_gpu_block: false,
+            loop_depth: 0,
+            errors: Vec::new(),
+        };
+        // Built-in functions
+        sa.functions.insert("print".to_string(),            (vec![Type::Unknown], Type::Void));
+        sa.functions.insert("println".to_string(),          (vec![Type::Unknown], Type::Void));
+        sa.functions.insert("exit".to_string(),             (vec![Type::Int64],   Type::Void));
+        sa.functions.insert("sqrt".to_string(),             (vec![Type::Float64], Type::Float64));
+        sa.functions.insert("abs".to_string(),              (vec![Type::Float64], Type::Float64));
+        sa.functions.insert("int64_to_float64".to_string(), (vec![Type::Int64],   Type::Float64));
+        sa.functions.insert("float64_to_int64".to_string(), (vec![Type::Float64], Type::Int64));
+        // Array builtins
+        sa.functions.insert("len".to_string(),      (vec![Type::Unknown], Type::Int64));
+        sa.functions.insert("push".to_string(),     (vec![Type::Unknown, Type::Unknown], Type::Void));
+        sa.functions.insert("pop".to_string(),      (vec![Type::Unknown], Type::Unknown));
+        // String builtins
+        sa.functions.insert("str_len".to_string(),    (vec![Type::Str], Type::Int64));
+        sa.functions.insert("str_concat".to_string(), (vec![Type::Str, Type::Str], Type::Str));
+        sa.functions.insert("str_eq".to_string(),     (vec![Type::Str, Type::Str], Type::Bool));
+        sa.functions.insert("str_index".to_string(),  (vec![Type::Str, Type::Int64], Type::Int64));
+        sa.functions.insert("int64_to_str".to_string(),(vec![Type::Int64], Type::Str));
+        sa.functions.insert("float64_to_str".to_string(),(vec![Type::Float64], Type::Str));
+        sa.functions.insert("char_to_str".to_string(), (vec![Type::Int64], Type::Str));
+        // File I/O builtins
+        sa.functions.insert("file_read".to_string(),  (vec![Type::Str], Type::Str));
+        sa.functions.insert("file_write".to_string(), (vec![Type::Str, Type::Str], Type::Bool));
+        sa.functions.insert("file_open_read".to_string(),  (vec![Type::Str], Type::Int64));
+        sa.functions.insert("file_open_write".to_string(), (vec![Type::Str], Type::Int64));
+        sa.functions.insert("file_close".to_string(),      (vec![Type::Int64], Type::Void));
+        sa.functions.insert("file_read_line".to_string(),  (vec![Type::Int64], Type::Str));
+        sa.functions.insert("file_write_line".to_string(), (vec![Type::Int64, Type::Str], Type::Void));
+        sa.functions.insert("file_eof".to_string(),        (vec![Type::Int64], Type::Bool));
+        sa
+    }
+
+    pub fn analyze(&mut self, program: &Program) -> Vec<String> {
+        // Register struct types first
+        for s in &program.structs {
+            let fields: Vec<(String, Type)> = s.fields.iter()
+                .map(|f| (f.name.clone(), f.ty.to_type()))
+                .collect();
+            self.structs.insert(s.name.clone(), fields);
+        }
+
+        // Register all user functions (forward declarations)
+        for f in &program.fns {
+            let param_types: Vec<Type> = f.params.iter().map(|p| p.ty.to_type()).collect();
+            self.functions.insert(f.name.clone(), (param_types, f.ret_ty.to_type()));
+        }
+
+        // Top-level lets/muts first so function bodies can reference them
+        for stmt in &program.top_level {
+            self.analyze_stmt(stmt, &Type::Void);
+        }
+
+        for f in &program.fns {
+            self.analyze_fn(f);
+        }
+
+        self.errors.clone()
+    }
+
+    fn analyze_fn(&mut self, f: &FnDef) {
+        self.push_scope();
+        for p in &f.params {
+            self.declare_var(&p.name, p.ty.to_type(), false);
+        }
+        let ret_ty = f.ret_ty.to_type();
+        for stmt in &f.body {
+            self.analyze_stmt(stmt, &ret_ty);
+        }
+        self.pop_scope();
+    }
+
+    fn push_scope(&mut self) { self.scopes.push(Scope { vars: HashMap::new() }); }
+    fn pop_scope(&mut self)  { self.scopes.pop(); }
+
+    fn declare_var(&mut self, name: &str, ty: Type, mutable: bool) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.vars.insert(name.to_string(), VarInfo { ty, mutable });
+        }
+    }
+
+    fn lookup_var(&self, name: &str) -> Option<&VarInfo> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(info) = scope.vars.get(name) {
+                return Some(info);
+            }
+        }
+        None
+    }
+
+    fn error(&mut self, msg: String) {
+        self.errors.push(msg);
+    }
+
+    fn analyze_stmt(&mut self, stmt: &Stmt, ret_ty: &Type) {
+        match stmt {
+            Stmt::Let { mutable, name, ty, init } => {
+                let inferred = self.infer_expr(init);
+                let resolved = if let Some(annotation) = ty {
+                    let ann_ty = annotation.to_type();
+                    if ann_ty != inferred && inferred != Type::Unknown {
+                        self.error(format!(
+                            "Type mismatch for `{}`: declared `{}` but init is `{}`",
+                            name, ann_ty, inferred
+                        ));
+                    }
+                    ann_ty
+                } else {
+                    inferred
+                };
+                self.declare_var(name, resolved, *mutable);
+            }
+
+            Stmt::Assign { target, value } => {
+                let val_ty = self.infer_expr(value);
+                match target {
+                    AssignTarget::Ident(name) => {
+                        let info = self.lookup_var(name).cloned();
+                        match info {
+                            None => self.error(format!("Undefined variable `{}`", name)),
+                            Some(info) => {
+                                if !info.mutable {
+                                    self.error(format!("Cannot assign to immutable variable `{}`", name));
+                                }
+                                if val_ty != info.ty && val_ty != Type::Unknown && info.ty != Type::Unknown {
+                                    self.error(format!(
+                                        "Type mismatch in assignment to `{}`: expected `{}`, got `{}`",
+                                        name, info.ty, val_ty
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    AssignTarget::Field(obj, field) => {
+                        let obj_ty = self.infer_expr(obj);
+                        if let Type::Struct(sname) = &obj_ty {
+                            if let Some(fields) = self.structs.get(sname).cloned() {
+                                if fields.iter().find(|(f, _)| f == field).is_none() {
+                                    self.error(format!("No field `{}` on struct `{}`", field, sname));
+                                }
+                            }
+                        }
+                    }
+                    AssignTarget::Index(obj, idx) => {
+                        self.infer_expr(obj);
+                        self.infer_expr(idx);
+                    }
+                }
+            }
+
+            Stmt::ExprStmt(e) => {
+                self.infer_expr(e);
+                if self.in_gpu_block {
+                    self.check_gpu_restrictions(e);
+                }
+            }
+
+            Stmt::Return(expr) => {
+                let actual = expr.as_ref().map(|e| self.infer_expr(e)).unwrap_or(Type::Void);
+                if *ret_ty != Type::Void && actual != *ret_ty && actual != Type::Unknown {
+                    self.error(format!(
+                        "Return type mismatch: expected `{}`, got `{}`", ret_ty, actual
+                    ));
+                }
+            }
+
+            Stmt::If { cond, then_block, else_block } => {
+                let ct = self.infer_expr(cond);
+                if ct != Type::Bool && ct != Type::Int64 && ct != Type::Unknown {
+                    self.error(format!("if condition must be `bool`, got `{}`", ct));
+                }
+                self.push_scope();
+                for s in then_block { self.analyze_stmt(s, ret_ty); }
+                self.pop_scope();
+                if let Some(eb) = else_block {
+                    self.push_scope();
+                    for s in eb { self.analyze_stmt(s, ret_ty); }
+                    self.pop_scope();
+                }
+            }
+
+            Stmt::While { cond, body } => {
+                let ct = self.infer_expr(cond);
+                if ct != Type::Bool && ct != Type::Int64 && ct != Type::Unknown {
+                    self.error(format!("while condition must be `bool`, got `{}`", ct));
+                }
+                self.loop_depth += 1;
+                self.push_scope();
+                for s in body { self.analyze_stmt(s, ret_ty); }
+                self.pop_scope();
+                self.loop_depth -= 1;
+            }
+
+            Stmt::For { var, start, end, body } => {
+                let st = self.infer_expr(start);
+                let et = self.infer_expr(end);
+                if st != Type::Int64 && st != Type::Unknown {
+                    self.error(format!("for range start must be `int64`, got `{}`", st));
+                }
+                if et != Type::Int64 && et != Type::Unknown {
+                    self.error(format!("for range end must be `int64`, got `{}`", et));
+                }
+                self.loop_depth += 1;
+                self.push_scope();
+                self.declare_var(var, Type::Int64, false);
+                for s in body { self.analyze_stmt(s, ret_ty); }
+                self.pop_scope();
+                self.loop_depth -= 1;
+            }
+
+            Stmt::GpuBlock(body) => {
+                let was = self.in_gpu_block;
+                self.in_gpu_block = true;
+                self.push_scope();
+                for s in body { self.analyze_stmt(s, ret_ty); }
+                self.pop_scope();
+                self.in_gpu_block = was;
+            }
+
+            Stmt::Break | Stmt::Continue => {
+                if self.loop_depth == 0 {
+                    self.error(format!("`{}` outside of loop", if matches!(stmt, Stmt::Break) { "break" } else { "continue" }));
+                }
+            }
+
+            Stmt::Import(_) => {}
+        }
+    }
+
+    fn check_gpu_restrictions(&mut self, expr: &Expr) {
+        let forbidden = ["file_read", "file_write", "file_open_read", "file_open_write",
+                         "file_read_line", "file_write_line", "file_close"];
+        if let Expr::Call { callee, .. } = expr {
+            if forbidden.contains(&callee.as_str()) {
+                self.error(format!(
+                    "GPU block: `{}` performs file I/O which is forbidden inside gpu blocks", callee
+                ));
+            }
+        }
+    }
+
+    pub fn infer_expr(&mut self, expr: &Expr) -> Type {
+        match expr {
+            Expr::IntLit(_)    => Type::Int64,
+            Expr::FloatLit(_)  => Type::Float64,
+            Expr::StringLit(_) => Type::Str,
+            Expr::BoolLit(_)   => Type::Bool,
+
+            Expr::Ident(name) => {
+                match self.lookup_var(name).cloned() {
+                    Some(info) => info.ty,
+                    None => {
+                        self.error(format!("Undefined variable `{}`", name));
+                        Type::Unknown
+                    }
+                }
+            }
+
+            Expr::BinOp { op, lhs, rhs } => {
+                let lt = self.infer_expr(lhs);
+                let rt = self.infer_expr(rhs);
+                match op {
+                    BinOp::EqEq | BinOp::NotEq => Type::Bool,
+                    BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => Type::Bool,
+                    BinOp::And | BinOp::Or => Type::Bool,
+                    _ => {
+                        if lt != rt && lt != Type::Unknown && rt != Type::Unknown {
+                            self.error(format!("Type mismatch: `{}` vs `{}`", lt, rt));
+                        }
+                        lt
+                    }
+                }
+            }
+
+            Expr::UnOp { op, expr } => {
+                let ty = self.infer_expr(expr);
+                match op {
+                    UnOp::Not => Type::Bool,
+                    UnOp::Neg => ty,
+                }
+            }
+
+            Expr::Call { callee, args } => {
+                let arg_types: Vec<Type> = args.iter().map(|a| self.infer_expr(a)).collect();
+                if self.in_gpu_block {
+                    for (i, at) in arg_types.iter().enumerate() {
+                        if matches!(at, Type::Tensor(hw) if *hw.as_ref() == HwTarget::Cpu) {
+                            self.error(format!(
+                                "Arg {} to `{}`: `tensor@cpu` in gpu block — use `.toGpu()` first",
+                                i + 1, callee
+                            ));
+                        }
+                    }
+                }
+                if let Some((_, ret)) = self.functions.get(callee).cloned() {
+                    ret
+                } else {
+                    self.error(format!("Undefined function `{}`", callee));
+                    Type::Unknown
+                }
+            }
+
+            Expr::MethodCall { obj, method, args } => {
+                let obj_ty = self.infer_expr(obj);
+                for a in args { self.infer_expr(a); }
+                match (&obj_ty, method.as_str()) {
+                    (Type::Tensor(_), "mean" | "sum") => Type::Float64,
+                    (Type::Tensor(hw), "pow") => Type::Tensor(hw.clone()),
+                    (Type::Array(inner), "len") => Type::Int64,
+                    (Type::Array(inner), "push") => Type::Void,
+                    (Type::Array(inner), "pop") => *inner.clone(),
+                    (Type::Str, "len") => Type::Int64,
+                    _ => Type::Unknown,
+                }
+            }
+
+            Expr::StructLit { name, fields } => {
+                if let Some(def_fields) = self.structs.get(name).cloned() {
+                    for (fname, val) in fields {
+                        let val_ty = self.infer_expr(val);
+                        if let Some((_, expected)) = def_fields.iter().find(|(f, _)| f == fname) {
+                            if val_ty != *expected && val_ty != Type::Unknown {
+                                self.error(format!(
+                                    "Struct `{}` field `{}`: expected `{}`, got `{}`",
+                                    name, fname, expected, val_ty
+                                ));
+                            }
+                        } else {
+                            self.error(format!("No field `{}` on struct `{}`", fname, name));
+                        }
+                    }
+                    Type::Struct(name.clone())
+                } else {
+                    self.error(format!("Unknown struct `{}`", name));
+                    Type::Unknown
+                }
+            }
+
+            Expr::FieldAccess { obj, field } => {
+                let obj_ty = self.infer_expr(obj);
+                match &obj_ty {
+                    Type::Struct(sname) => {
+                        if let Some(fields) = self.structs.get(sname).cloned() {
+                            if let Some((_, ty)) = fields.iter().find(|(f, _)| f == field) {
+                                ty.clone()
+                            } else {
+                                self.error(format!("No field `{}` on struct `{}`", field, sname));
+                                Type::Unknown
+                            }
+                        } else {
+                            Type::Unknown
+                        }
+                    }
+                    _ => Type::Unknown,
+                }
+            }
+
+            Expr::Index { obj, idx } => {
+                let obj_ty = self.infer_expr(obj);
+                self.infer_expr(idx);
+                match obj_ty {
+                    Type::Array(inner) => *inner,
+                    Type::Str => Type::Int64, // char as int
+                    _ => Type::Unknown,
+                }
+            }
+
+            Expr::ArrayLit(elems) => {
+                if elems.is_empty() {
+                    return Type::Array(Box::new(Type::Unknown));
+                }
+                let first = self.infer_expr(&elems[0]);
+                for e in &elems[1..] {
+                    let t = self.infer_expr(e);
+                    if t != first && t != Type::Unknown {
+                        self.error(format!("Array elements must have uniform type: `{}` vs `{}`", first, t));
+                    }
+                }
+                Type::Array(Box::new(first))
+            }
+
+            Expr::ToGpu(inner) => {
+                let ty = self.infer_expr(inner);
+                match ty {
+                    Type::Tensor(_) => Type::Tensor(Box::new(HwTarget::Gpu)),
+                    other => { self.error(format!("`.toGpu()` requires a tensor, got `{}`", other)); Type::Unknown }
+                }
+            }
+
+            Expr::ToCpu(inner) => {
+                let ty = self.infer_expr(inner);
+                match ty {
+                    Type::Tensor(_) => Type::Tensor(Box::new(HwTarget::Cpu)),
+                    other => { self.error(format!("`.toCpu()` requires a tensor, got `{}`", other)); Type::Unknown }
+                }
+            }
+        }
+    }
+}

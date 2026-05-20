@@ -1,0 +1,8 @@
+// Hello World in AIL
+let message = "Hello from AIL!";
+print(message);
+
+let x = 42;
+let y = 8;
+let sum = x + y;
+print(sum);

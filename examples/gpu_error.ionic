@@ -1,0 +1,6 @@
+// This should FAIL — using a tensor@cpu directly inside a gpu block
+let inputs: tensor@cpu = inputs;
+
+gpu {
+    let result = forward(inputs, weights);
+}

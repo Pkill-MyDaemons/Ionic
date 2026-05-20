@@ -1,0 +1,77 @@
+// Bootstrap language feature test
+// Everything the compiler needs to eventually write itself
+
+// ── Structs ───────────────────────────────────────────────────────
+struct Point {
+    x: int64,
+    y: int64
+}
+
+struct Token {
+    kind: int64,
+    line: int64,
+    col:  int64
+}
+
+fn make_point(int64 x, int64 y) -> Point {
+    return Point { x: x, y: y };
+}
+
+fn point_sum(Point p) -> int64 {
+    return p.x + p.y;
+}
+
+let pt = make_point(3, 7);
+print(point_sum(pt));   // 10
+
+// ── Arrays ────────────────────────────────────────────────────────
+let arr = [10, 20, 30, 40, 50];
+print(len(arr));         // 5
+print(arr[0]);           // 10
+print(arr[4]);           // 50
+
+// ── Dynamic array / push ─────────────────────────────────────────
+mut buf = [0];
+mut i = 0;
+while (i < 5) {
+    push(buf, i * i);
+    i = i + 1;
+}
+print(len(buf));   // 6 (one pre-existing + 5 pushed)
+
+// ── Strings ───────────────────────────────────────────────────────
+let hello = "hello";
+let world = " world";
+let joined = str_concat(hello, world);
+print(joined);          // hello world
+print(str_len(joined)); // 11
+print(str_eq("abc", "abc"));  // 1
+print(str_eq("abc", "xyz"));  // 0
+
+// ── Int/float -> string ───────────────────────────────────────────
+let ns = int64_to_str(12345);
+print(ns);
+let fs = float64_to_str(3.14);
+print(fs);
+
+// ── Break and continue ────────────────────────────────────────────
+mut sum = 0;
+for (k in 0..100) {
+    if (k == 10) { break; }
+    sum = sum + k;
+}
+print(sum);   // 0+1+...+9 = 45
+
+mut evens = 0;
+for (k in 0..20) {
+    if (k - (k / 2) * 2 != 0) { continue; }
+    evens = evens + 1;
+}
+print(evens);  // 10 even numbers 0..19
+
+// ── File I/O ──────────────────────────────────────────────────────
+file_write("/tmp/ionic_test.txt", "Hello from Ionic!\n");
+let content = file_read("/tmp/ionic_test.txt");
+print(content);
+
+print("bootstrap test done");
