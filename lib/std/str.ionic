@@ -1,0 +1,139 @@
+/// String utility functions.
+/// Import: `import std.str.*;`
+
+/// Returns true if s contains the substring sub.
+fn contains(string s, string sub) -> bool {
+    let slen = str_len(s);
+    let sublen = str_len(sub);
+    if (sublen > slen) { return false; }
+    if (sublen == 0) { return true; }
+    mut i = 0;
+    while (i <= slen - sublen) {
+        mut match_ = true;
+        mut j = 0;
+        while (j < sublen) {
+            if (str_index(s, i + j) != str_index(sub, j)) {
+                match_ = false;
+                j = sublen;
+            }
+            j = j + 1;
+        }
+        if (match_) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Returns true if s starts with the given prefix.
+fn starts_with(string s, string prefix) -> bool {
+    let plen = str_len(prefix);
+    if (plen > str_len(s)) { return false; }
+    mut i = 0;
+    while (i < plen) {
+        if (str_index(s, i) != str_index(prefix, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Returns true if s ends with the given suffix.
+fn ends_with(string s, string suffix) -> bool {
+    let slen = str_len(s);
+    let suflen = str_len(suffix);
+    if (suflen > slen) { return false; }
+    let offset = slen - suflen;
+    mut i = 0;
+    while (i < suflen) {
+        if (str_index(s, offset + i) != str_index(suffix, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Repeats s exactly n times.
+fn repeat(string s, int64 n) -> string {
+    mut result = "";
+    mut i = 0;
+    while (i < n) {
+        result = str_concat(result, s);
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Counts how many times the ASCII character code ch appears in s.
+fn count_char(string s, int64 ch) -> int64 {
+    let n = str_len(s);
+    mut count = 0;
+    mut i = 0;
+    while (i < n) {
+        if (str_index(s, i) == ch) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// Left-pads s with pad_ch until its length is at least width.
+fn pad_left(string s, int64 width, string pad_ch) -> string {
+    mut result = s;
+    while (str_len(result) < width) {
+        result = str_concat(pad_ch, result);
+    }
+    return result;
+}
+
+/// Right-pads s with pad_ch until its length is at least width.
+fn pad_right(string s, int64 width, string pad_ch) -> string {
+    mut result = s;
+    while (str_len(result) < width) {
+        result = str_concat(result, pad_ch);
+    }
+    return result;
+}
+
+/// Returns s with leading ASCII spaces removed.
+fn trim_left(string s) -> string {
+    let n = str_len(s);
+    mut i = 0;
+    while (i < n && str_index(s, i) == 32) {
+        i = i + 1;
+    }
+    mut result = "";
+    while (i < n) {
+        result = str_concat(result, char_to_str(str_index(s, i)));
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Returns s with trailing ASCII spaces removed.
+fn trim_right(string s) -> string {
+    mut end = str_len(s) - 1;
+    while (end >= 0 && str_index(s, end) == 32) {
+        end = end - 1;
+    }
+    mut result = "";
+    mut i = 0;
+    while (i <= end) {
+        result = str_concat(result, char_to_str(str_index(s, i)));
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Returns s with leading and trailing ASCII spaces removed.
+fn trim(string s) -> string {
+    return trim_left(trim_right(s));
+}
+
+/// Reverses a string character by character.
+fn str_reverse(string s) -> string {
+    let n = str_len(s);
+    mut result = "";
+    mut i = n - 1;
+    while (i >= 0) {
+        result = str_concat(result, char_to_str(str_index(s, i)));
+        i = i - 1;
+    }
+    return result;
+}

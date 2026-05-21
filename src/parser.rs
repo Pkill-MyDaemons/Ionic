@@ -62,7 +62,19 @@ impl Parser {
         let mut top_level = Vec::new();
 
         while *self.peek() != Token::EOF {
-            // Hardware annotation may prefix struct/fn/let/mut at any level
+            // Collect consecutive /// doc-comment lines
+            let mut doc_lines: Vec<String> = Vec::new();
+            while matches!(self.peek(), Token::DocComment(_)) {
+                if let Token::DocComment(s) = self.advance() {
+                    doc_lines.push(s);
+                }
+            }
+            let doc: Option<String> = if doc_lines.is_empty() {
+                None
+            } else {
+                Some(doc_lines.join("\n"))
+            };
+
             let hw = self.parse_hw_annotation()?;
             match self.peek().clone() {
                 Token::Import => {
@@ -71,11 +83,13 @@ impl Parser {
                 Token::Struct => {
                     let mut sd = self.parse_struct()?;
                     sd.hw = hw;
+                    sd.doc = doc;
                     structs.push(sd);
                 }
                 Token::Fn => {
                     let mut fd = self.parse_fn()?;
                     fd.hw = hw;
+                    fd.doc = doc;
                     fns.push(fd);
                 }
                 _ => {
@@ -128,15 +142,46 @@ impl Parser {
 
     // ── Import ────────────────────────────────────────────────────────────────
 
-    fn parse_import(&mut self) -> Result<Vec<String>, String> {
+    fn parse_import(&mut self) -> Result<Import, String> {
         self.advance(); // consume `import`
         let mut path = vec![self.expect_ident()?];
-        while *self.peek() == Token::Dot {
-            self.advance();
+
+        // Consume dotted path segments, stopping before `.*` or `.{` or `;`
+        loop {
+            if *self.peek() != Token::Dot { break; }
+            // Peek one further: if it's Star or LBrace, stop path parsing
+            match self.peek_ahead(1) {
+                Token::Star | Token::LBrace => break,
+                Token::EOF | Token::Semicolon => break,
+                _ => {}
+            }
+            self.advance(); // consume `.`
             path.push(self.expect_ident()?);
         }
+
+        let kind = if *self.peek() == Token::Dot {
+            self.advance(); // consume `.`
+            if *self.peek() == Token::Star {
+                self.advance(); // consume `*`
+                ImportKind::Glob
+            } else if *self.peek() == Token::LBrace {
+                self.advance(); // consume `{`
+                let mut names = Vec::new();
+                while *self.peek() != Token::RBrace && *self.peek() != Token::EOF {
+                    names.push(self.expect_ident()?);
+                    if *self.peek() == Token::Comma { self.advance(); }
+                }
+                self.expect(&Token::RBrace)?;
+                ImportKind::Named(names)
+            } else {
+                return Err(format!("Line {}: expected `*` or `{{` after `.` in import", self.line()));
+            }
+        } else {
+            ImportKind::Module
+        };
+
         self.expect(&Token::Semicolon)?;
-        Ok(path)
+        Ok(Import { path, kind })
     }
 
     // ── Struct definition ─────────────────────────────────────────────────────
@@ -156,7 +201,7 @@ impl Parser {
             }
         }
         self.expect(&Token::RBrace)?;
-        Ok(StructDef { name, fields, hw: None })
+        Ok(StructDef { name, fields, hw: None, doc: None })
     }
 
     // ── Function definition ───────────────────────────────────────────────────
@@ -186,7 +231,7 @@ impl Parser {
         };
 
         let body = self.parse_block()?;
-        Ok(FnDef { name, params, ret_ty, body, line, hw: None })
+        Ok(FnDef { name, params, ret_ty, body, line, hw: None, doc: None })
     }
 
     // ── Type annotation ───────────────────────────────────────────────────────
@@ -294,8 +339,8 @@ impl Parser {
             }
 
             Token::Import => {
-                let path = self.parse_import()?;
-                Ok(Stmt::Import(path))
+                let imp = self.parse_import()?;
+                Ok(Stmt::Import(imp))
             }
 
             Token::Ident(name) => {

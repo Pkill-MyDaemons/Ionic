@@ -222,7 +222,7 @@ pub enum Stmt {
         body: Block,
     },
     GpuBlock(Block),
-    Import(Vec<String>),
+    Import(Import),
     Break,
     Continue,
 }
@@ -243,6 +243,7 @@ pub struct StructDef {
     pub name: String,
     pub fields: Vec<FieldDef>,
     pub hw: Option<HwAnnotation>,
+    pub doc: Option<String>,
 }
 
 /// Top-level function definition (optionally annotated with placement)
@@ -254,12 +255,28 @@ pub struct FnDef {
     pub body: Block,
     pub line: usize,
     pub hw: Option<HwAnnotation>,
+    pub doc: Option<String>,
+}
+
+/// Import kind — what names from the module to bring in
+#[derive(Debug, Clone)]
+pub enum ImportKind {
+    Glob,                 // import std.math.*;   — all, selectively compiled
+    Named(Vec<String>),   // import std.math.{clamp, PI};
+    Module,               // import std.math;     — Phase 1: treated as Glob
+}
+
+/// A single import statement
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub path: Vec<String>,  // ["std", "math"]
+    pub kind: ImportKind,
 }
 
 /// Root of the AST
 #[derive(Debug, Clone)]
 pub struct Program {
-    pub imports: Vec<Vec<String>>,
+    pub imports: Vec<Import>,
     pub structs: Vec<StructDef>,
     pub fns: Vec<FnDef>,
     pub top_level: Block,

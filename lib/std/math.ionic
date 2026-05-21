@@ -1,0 +1,63 @@
+/// Mathematical constants and utility functions.
+/// Import: `import std.math.*;`
+
+/// Ratio of a circle's circumference to its diameter.
+let PI: float64 = 3.14159265358979323846;
+
+/// 2 * PI — full turn in radians.
+let TAU: float64 = 6.28318530717958647692;
+
+/// Euler's number — base of the natural logarithm.
+let E: float64 = 2.71828182845904523536;
+
+/// Clamps x to the closed interval [lo, hi].
+fn clamp(float64 x, float64 lo, float64 hi) -> float64 {
+    if (x < lo) { return lo; }
+    if (x > hi) { return hi; }
+    return x;
+}
+
+/// Linear interpolation: a + t * (b - a).  t=0 returns a, t=1 returns b.
+fn lerp(float64 a, float64 b, float64 t) -> float64 {
+    return a + t * (b - a);
+}
+
+/// Returns -1.0, 0.0, or 1.0 depending on the sign of x.
+fn sign(float64 x) -> float64 {
+    if (x > 0.0) { return 1.0; }
+    if (x < 0.0) { return -1.0; }
+    return 0.0;
+}
+
+/// Returns the smaller of two float64 values.
+fn min_f(float64 a, float64 b) -> float64 {
+    if (a < b) { return a; }
+    return b;
+}
+
+/// Returns the larger of two float64 values.
+fn max_f(float64 a, float64 b) -> float64 {
+    if (a > b) { return a; }
+    return b;
+}
+
+/// Converts radians to degrees.
+fn degrees(float64 r) -> float64 {
+    return r * (180.0 / PI);
+}
+
+/// Converts degrees to radians.
+fn radians(float64 d) -> float64 {
+    return d * (PI / 180.0);
+}
+
+/// Returns base raised to the power exp (integer exponent, float64 base).
+fn pow_i(float64 base, int64 exp) -> float64 {
+    mut result = 1.0;
+    mut n = exp;
+    if (n < 0) { n = -n; }
+    for (i in 0..n) {
+        result = result * base;
+    }
+    return result;
+}

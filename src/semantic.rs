@@ -57,6 +57,23 @@ impl SemanticAnalyzer {
         // ML model builtins
         sa.functions.insert("load_model".to_string(),
             (vec![Type::Str], Type::Model(Box::new(HwTarget::Cpu))));
+        sa.functions.insert("model_free".to_string(),
+            (vec![Type::Model(Box::new(HwTarget::Cpu))], Type::Void));
+        sa.functions.insert("piper_forward".to_string(),
+            (vec![Type::Model(Box::new(HwTarget::Cpu)), Type::Array(Box::new(Type::Int64)),
+                  Type::Float64, Type::Float64, Type::Float64],
+             Type::Array(Box::new(Type::Float64))));
+        sa.functions.insert("write_wav".to_string(),
+            (vec![Type::Str, Type::Array(Box::new(Type::Float64)), Type::Int64, Type::Int64],
+             Type::Void));
+        sa.functions.insert("fgets_stdin".to_string(),
+            (vec![Type::Int64], Type::Str));
+        sa.functions.insert("gguf_generate".to_string(),
+            (vec![Type::Model(Box::new(HwTarget::Cpu)), Type::Str, Type::Int64], Type::Str));
+        sa.functions.insert("gguf_set_temp".to_string(),
+            (vec![Type::Model(Box::new(HwTarget::Cpu)), Type::Float64], Type::Void));
+        sa.functions.insert("gguf_set_top_p".to_string(),
+            (vec![Type::Model(Box::new(HwTarget::Cpu)), Type::Float64], Type::Void));
         // File I/O builtins
         sa.functions.insert("file_read".to_string(),  (vec![Type::Str], Type::Str));
         sa.functions.insert("file_write".to_string(), (vec![Type::Str, Type::Str], Type::Bool));
@@ -404,6 +421,12 @@ impl SemanticAnalyzer {
 
             Expr::FieldAccess { obj, field } => {
                 let obj_ty = self.infer_expr(obj);
+                if field == "len" {
+                    match &obj_ty {
+                        Type::Array(_) | Type::Str => return Type::Int64,
+                        _ => {}
+                    }
+                }
                 match &obj_ty {
                     Type::Struct(sname) => {
                         if let Some(fields) = self.structs.get(sname).cloned() {

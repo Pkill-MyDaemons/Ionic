@@ -1,6 +1,7 @@
 mod lexer;
 mod ast;
 mod parser;
+mod imports;
 mod semantic;
 mod codegen;
 
@@ -29,7 +30,24 @@ fn main() {
 
     // ── Parse ─────────────────────────────────────────────────────────────────
     let mut parser = parser::Parser::new(tokens);
-    let program = parser.parse().unwrap_or_else(|e| die(&format!("[Parse Error] {}", e)));
+    let mut program = parser.parse().unwrap_or_else(|e| die(&format!("[Parse Error] {}", e)));
+
+    // ── Import resolution (selective compilation) ─────────────────────────────
+    if !program.imports.is_empty() {
+        let pool = imports::build_lib_pool(&program.imports)
+            .unwrap_or_else(|e| die(&format!("[Import Error] {}", e)));
+        let (lib_fns, lib_structs, lib_globals) = imports::bfs_reachable(&program, &pool);
+        // Prepend library symbols so they appear before user code
+        let mut merged_fns = lib_fns;
+        merged_fns.extend(program.fns);
+        program.fns = merged_fns;
+        let mut merged_structs = lib_structs;
+        merged_structs.extend(program.structs);
+        program.structs = merged_structs;
+        let mut merged_top = lib_globals;
+        merged_top.extend(program.top_level);
+        program.top_level = merged_top;
+    }
 
     if flags.dump_ast {
         eprintln!("{:#?}", program);
@@ -70,11 +88,36 @@ fn main() {
     let clang = find_clang();
 
     // Compile the model runtime C file if present
-    let runtime_c = runtime_c_path();
-    let runtime_obj = "/tmp/ionic_model_runtime.o";
+    let runtime_c   = runtime_c_path();
+    let runtime_obj  = "/tmp/ionic_model_runtime.o";
+
+    // Backend detection
+    let ort_inc  = ort_include_path();
+    let ort_lib  = ort_lib_path();
+    let has_ort  = ort_inc.is_some() && ort_lib.is_some();
+
+    let llama_inc = llama_include_path();
+    let llama_lib = llama_lib_path();
+    let has_llama = llama_inc.is_some() && llama_lib.is_some();
+
     let has_runtime = if let Some(ref rc) = runtime_c {
+        let mut compile_args: Vec<String> = vec![
+            "-c".to_string(), rc.clone(), "-o".to_string(), runtime_obj.to_string(),
+        ];
+        if has_ort {
+            compile_args.push(format!("-DIONIC_HAVE_ORT"));
+            if let Some(ref inc) = ort_inc {
+                compile_args.push(format!("-I{}", inc));
+            }
+        }
+        if has_llama {
+            compile_args.push(format!("-DIONIC_HAVE_LLAMA"));
+            if let Some(ref inc) = llama_inc {
+                compile_args.push(format!("-I{}", inc));
+            }
+        }
         let st = Command::new(&clang)
-            .args(["-c", rc.as_str(), "-o", runtime_obj])
+            .args(&compile_args)
             .status()
             .unwrap_or_else(|e| die(&format!("Cannot compile model runtime ({}): {}", rc, e)));
         st.success()
@@ -82,9 +125,25 @@ fn main() {
         false
     };
 
-    let mut clang_args: Vec<&str> = vec![&ir_path, "-o", &out_bin, "-lm"];
+    let mut clang_args: Vec<String> = vec![
+        ir_path.clone(), "-o".to_string(), out_bin.clone(), "-lm".to_string(),
+    ];
     if has_runtime {
-        clang_args.push(runtime_obj);
+        clang_args.push(runtime_obj.to_string());
+    }
+    if has_ort {
+        if let Some(ref lib) = ort_lib {
+            clang_args.push(format!("-L{}", lib));
+            clang_args.push("-lonnxruntime".to_string());
+            clang_args.push(format!("-Wl,-rpath,{}", lib));
+        }
+    }
+    if has_llama {
+        if let Some(ref lib) = llama_lib {
+            clang_args.push(format!("-L{}", lib));
+            clang_args.push("-lllama".to_string());
+            clang_args.push(format!("-Wl,-rpath,{}", lib));
+        }
     }
 
     let status = Command::new(&clang)
@@ -194,4 +253,67 @@ fn find_clang() -> String {
 fn die(msg: &str) -> ! {
     eprintln!("{}", msg);
     std::process::exit(1);
+}
+
+/// Return the llama.cpp include directory if found.
+fn llama_include_path() -> Option<String> {
+    let candidates = [
+        "/opt/homebrew/include",
+        "/opt/homebrew/Cellar/llama.cpp/9260/include",
+        "/usr/local/include",
+    ];
+    for c in &candidates {
+        if Path::new(c).join("llama.h").exists() {
+            return Some(c.to_string());
+        }
+    }
+    None
+}
+
+/// Return the llama.cpp library directory if found.
+fn llama_lib_path() -> Option<String> {
+    let candidates = [
+        "/opt/homebrew/lib",
+        "/opt/homebrew/Cellar/llama.cpp/9260/lib",
+        "/usr/local/lib",
+    ];
+    for c in &candidates {
+        if Path::new(c).join("libllama.dylib").exists()
+            || Path::new(c).join("libllama.so").exists()
+        {
+            return Some(c.to_string());
+        }
+    }
+    None
+}
+
+/// Return the ONNX Runtime include directory if found.
+fn ort_include_path() -> Option<String> {
+    let candidates = [
+        "/opt/homebrew/include/onnxruntime",
+        "/opt/homebrew/Cellar/onnxruntime/1.26.0/include/onnxruntime",
+        "/usr/local/include/onnxruntime",
+    ];
+    for c in &candidates {
+        if Path::new(c).exists() {
+            return Some(c.to_string());
+        }
+    }
+    None
+}
+
+/// Return the ONNX Runtime library directory if found.
+fn ort_lib_path() -> Option<String> {
+    let candidates = [
+        "/opt/homebrew/lib",
+        "/opt/homebrew/Cellar/onnxruntime/1.26.0/lib",
+        "/usr/local/lib",
+    ];
+    for c in &candidates {
+        let lib = Path::new(c).join("libonnxruntime.dylib");
+        if lib.exists() {
+            return Some(c.to_string());
+        }
+    }
+    None
 }

@@ -1,0 +1,36 @@
+/// I/O utilities beyond the built-in print/file functions.
+/// Import: `import std.io.*;`
+
+/// Reads one line from stdin (up to 4096 bytes). Strips the trailing newline.
+fn readline() -> string {
+    return fgets_stdin(4096);
+}
+
+/// Reads one line from stdin with a custom max byte limit.
+fn readline_n(int64 max_bytes) -> string {
+    return fgets_stdin(max_bytes);
+}
+
+/// Prints s to stderr without a newline.
+fn eprint(string s) -> int64 {
+    file_write("/dev/stderr", s);
+    return 0;
+}
+
+/// Prints s to stderr followed by a newline.
+fn eprintln(string s) -> int64 {
+    file_write("/dev/stderr", str_concat(s, "\n"));
+    return 0;
+}
+
+/// Prints a separator line of `width` dashes to stdout.
+fn print_hr(int64 width) -> int64 {
+    mut line = "";
+    mut i = 0;
+    while (i < width) {
+        line = str_concat(line, "-");
+        i = i + 1;
+    }
+    print(line);
+    return 0;
+}

@@ -69,6 +69,8 @@ pub enum Token {
     RBrace,
     LBracket,
     RBracket,
+    // Documentation comment  ///
+    DocComment(String),
     // End of file
     EOF,
 }
@@ -133,6 +135,7 @@ impl fmt::Display for Token {
             Token::RBrace => write!(f, "}}"),
             Token::LBracket => write!(f, "["),
             Token::RBracket => write!(f, "]"),
+            Token::DocComment(s) => write!(f, "///{}", s),
             Token::EOF => write!(f, "<EOF>"),
         }
     }
@@ -199,11 +202,22 @@ impl Lexer {
         c
     }
 
+    fn is_doc_comment(&self) -> bool {
+        self.src.get(self.pos)     == Some(&'/')
+            && self.src.get(self.pos + 1) == Some(&'/')
+            && self.src.get(self.pos + 2) == Some(&'/')
+    }
+
     fn skip_whitespace_and_comments(&mut self) {
         loop {
             while matches!(self.peek(), Some(c) if c.is_whitespace()) {
                 self.advance();
             }
+            // `///` doc-comments are emitted as tokens — leave them for next_token
+            if self.is_doc_comment() {
+                break;
+            }
+            // Regular `//` comment — consume to end of line and continue
             if self.peek() == Some('/') && self.peek2() == Some('/') {
                 while self.peek().is_some() && self.peek() != Some('\n') {
                     self.advance();
@@ -227,6 +241,17 @@ impl Lexer {
             None => return Ok(self.spanned(Token::EOF, line, col)),
             Some(c) => c,
         };
+
+        // Doc comment: /// content
+        if self.is_doc_comment() {
+            self.advance(); self.advance(); self.advance(); // consume ///
+            if self.peek() == Some(' ') { self.advance(); } // strip one leading space
+            let mut content = String::new();
+            while self.peek().is_some() && self.peek() != Some('\n') {
+                content.push(self.advance().unwrap());
+            }
+            return Ok(self.spanned(Token::DocComment(content), line, col));
+        }
 
         // String literal
         if ch == '"' {

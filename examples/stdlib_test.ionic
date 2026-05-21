@@ -1,0 +1,37 @@
+/// Test selective imports from the standard library.
+/// Only clamp, lerp, contains, trim, arr_sum, and readline are used —
+/// all other library functions should be absent from the IR.
+
+import std.math.*;
+import std.str.*;
+import std.array.*;
+import std.io.*;
+
+fn main() -> int64 {
+    // ── math ─────────────────────────────────────────────────────────────────
+    let v = clamp(2.5, 0.0, 1.0);
+    print(str_concat("clamp(2.5, 0,1) = ", float64_to_str(v)));
+
+    let mid = lerp(0.0, 100.0, 0.25);
+    print(str_concat("lerp(0,100,0.25) = ", float64_to_str(mid)));
+
+    print(str_concat("PI = ", float64_to_str(PI)));
+
+    // ── str ──────────────────────────────────────────────────────────────────
+    let found = contains("hello world", "world");
+    if (found) { print("contains: ok"); }
+
+    let trimmed = trim("   hello   ");
+    print(str_concat("trim: '", str_concat(trimmed, "'")));
+
+    // ── array ─────────────────────────────────────────────────────────────────
+    let nums = [10, 20, 30, 40];
+    let total = arr_sum(nums);
+    print(str_concat("arr_sum = ", int64_to_str(total)));
+
+    // ── io ────────────────────────────────────────────────────────────────────
+    print_hr(40);
+    eprintln("(eprintln goes to stderr)");
+
+    return 0;
+}

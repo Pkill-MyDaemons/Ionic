@@ -1,0 +1,41 @@
+// Piper TTS demo — synthesize speech using the en_US-amy-low ONNX model.
+//
+// Phoneme IDs for "Hello world." (en_US espeak phonemes, from the model JSON):
+//   ^=1  h=20  ə=59  l=24  ˈo=27  ʊ=100  _=0  w=35  ˈɜ=62  l=24  d=17  $=2
+// We wrap with ^ (sentence start) and $ (sentence end) and use spaces (3) between words.
+//
+// Run: ./target/release/ionic src/piper_demo.ionic -o /tmp/piper_demo
+//      clang /tmp/piper_demo.ll src/ionic_model_runtime.c -o /tmp/piper_demo \
+//        -I/opt/homebrew/Cellar/onnxruntime/1.26.0/include/onnxruntime \
+//        -L/opt/homebrew/Cellar/onnxruntime/1.26.0/lib -lonnxruntime -lm
+//      /tmp/piper_demo models/en_US-amy-low.onnx output.wav
+
+fn main() -> int64 {
+    let model_path = get_arg(0);
+    let out_path   = get_arg(1);
+
+    // Load the model (CoreML GPU provider is enabled automatically on macOS)
+    let mdl = load_model(model_path);
+
+    // Phoneme IDs for "Hello world." — hand-crafted from the phoneme_id_map in en_US-amy-low.onnx.json
+    // Format: 1 (^), phonemes..., 2 ($)
+    // "hɛloʊ wɜːld" (simplified): h=20 ɛ=61 l=24 oʊ→o=27 ʊ=100 (space)=3 w=35 ɜ=62 ː=122 l=24 d=17
+    mut phonemes = [1, 20, 61, 24, 27, 100, 3, 35, 62, 122, 24, 17, 2];
+
+    // Piper inference params (from en_US-amy-low.onnx.json)
+    let noise_scale  = 0.667;
+    let length_scale = 1.0;
+    let noise_w      = 0.8;
+
+    // Run inference — returns array of float64 audio samples
+    let samples = piper_forward(mdl, phonemes, noise_scale, length_scale, noise_w);
+
+    // Write to WAV at 16000 Hz (Piper low-quality sample rate)
+    // Pass n_samples=0 so C runtime uses arr->len automatically
+    write_wav(out_path, samples, 0, 16000);
+
+    print("Done! Audio written to: ");
+    print(out_path);
+
+    return 0;
+}

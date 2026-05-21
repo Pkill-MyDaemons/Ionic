@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::ast::*;
 
 /// Struct layout: field names in order (all fields are i64-sized for simplicity in Phase 1)
@@ -20,6 +20,8 @@ pub struct Codegen {
     // Break/continue target label stacks
     break_labels: Vec<String>,
     continue_labels: Vec<String>,
+    // Top-level variable names declared as LLVM globals (accessible from functions)
+    global_var_names: HashSet<String>,
 }
 
 impl Codegen {
@@ -36,6 +38,7 @@ impl Codegen {
             label: 0,
             break_labels: Vec::new(),
             continue_labels: Vec::new(),
+            global_var_names: HashSet::new(),
         }
     }
 
@@ -114,6 +117,27 @@ impl Codegen {
             r
         } else {
             val.to_string()
+        }
+    }
+
+    // ── Global variable type inference ───────────────────────────────────────
+    // Returns (llvm_ty_str, zero_init_str, ast_Type) for a top-level variable.
+    fn infer_global_ty(init: &Expr) -> (&'static str, String, Type) {
+        match init {
+            Expr::IntLit(n)   => ("i64",  n.to_string(),    Type::Int64),
+            Expr::BoolLit(b)  => ("i64",  if *b {"1"} else {"0"}.to_string(), Type::Int64),
+            Expr::FloatLit(f) => ("double", format!("{:.17e}", f), Type::Float64),
+            Expr::StringLit(_) => ("ptr", "null".to_string(), Type::Str),
+            Expr::ArrayLit(elems) => {
+                let inner = match elems.first() {
+                    Some(Expr::IntLit(_)) | Some(Expr::BoolLit(_)) => Type::Int64,
+                    Some(Expr::FloatLit(_)) => Type::Float64,
+                    Some(Expr::StringLit(_)) => Type::Str,
+                    _ => Type::Int64, // conservative default
+                };
+                ("ptr", "null".to_string(), Type::Array(Box::new(inner)))
+            }
+            _ => ("ptr", "null".to_string(), Type::Str),
         }
     }
 
@@ -196,6 +220,12 @@ impl Codegen {
         self.emit("declare ptr  @ionic_load_model(ptr)");
         self.emit("declare ptr  @ionic_model_forward(ptr, ptr)");
         self.emit("declare void @ionic_model_free(ptr)");
+        self.emit("declare ptr  @ionic_piper_forward(ptr, ptr, double, double, double)");
+        self.emit("declare void @ionic_write_wav(ptr, ptr, i64, i64)");
+        self.emit("declare ptr  @ionic_gguf_generate(ptr, ptr, i64)");
+        self.emit("declare void @ionic_gguf_set_temp(ptr, double)");
+        self.emit("declare void @ionic_gguf_set_top_p(ptr, double)");
+        self.emit("declare ptr  @ionic_fgets_stdin(ptr, i32)");
         // System runtime
         self.emit("declare void @ionic_runtime_init(i32, ptr)");
         self.emit("declare ptr  @ionic_get_arg(i64)");
@@ -220,19 +250,24 @@ impl Codegen {
         }
         if !struct_names.is_empty() { self.emit(""); }
 
-        // Pre-emit top-level immutable integer constants as LLVM globals
-        // so function bodies can reference them.
+        // Pre-emit ALL top-level let/mut variables as LLVM globals so that function
+        // bodies can read and write them.  Scalars get their compile-time value;
+        // everything else is null-initialized and runtime-assigned in main().
         let mut had_globals = false;
         for stmt in &program.top_level {
-            if let Stmt::Let { mutable: false, name, ty: _, init, hw: _ } = stmt {
-                if let Expr::IntLit(n) = init {
-                    self.emit(&format!("@{} = private global i64 {}, align 8", name, n));
-                    self.declare_var(name, format!("@{}", name), Type::Int64);
-                    had_globals = true;
-                }
+            if let Stmt::Let { mutable, name, ty: _, init, hw: _ } = stmt {
+                let (llty, zero_init, var_ty) = Self::infer_global_ty(init);
+                let vis = if !mutable && llty == "i64" { "private global" } else { "global" };
+                self.emit(&format!("@{} = {} {} {}, align 8", name, vis, llty, zero_init));
+                self.declare_var(name, format!("@{}", name), var_ty);
+                self.global_var_names.insert(name.clone());
+                had_globals = true;
             }
         }
         if had_globals { self.emit(""); }
+
+        let has_user_main = program.fns.iter()
+            .any(|f| f.name == "main" && f.params.is_empty());
 
         let fns: Vec<FnDef> = program.fns.clone();
         for f in &fns {
@@ -240,7 +275,7 @@ impl Codegen {
         }
 
         let top: Vec<Stmt> = program.top_level.clone();
-        self.emit_main(&top);
+        self.emit_main(&top, has_user_main);
 
         // Flush interned string literals
         let lits = self.str_lits.clone();
@@ -409,11 +444,18 @@ impl Codegen {
 
         let ret_llvm = Self::llvm_ty(&f.ret_ty.to_type());
 
+        // Rename user's `fn main()` to avoid collision with the runtime wrapper @main
+        let emit_name = if f.name == "main" && f.params.is_empty() {
+            "ionic_user_main".to_string()
+        } else {
+            f.name.clone()
+        };
+
         // Emit hw placement metadata as IR comment on the function
         if let Some(hw) = &f.hw {
             self.emit(&format!("  {}", hw.ir_comment()));
         }
-        self.emit(&format!("define {} @{}({}) {{", ret_llvm, f.name, params_ir.join(", ")));
+        self.emit(&format!("define {} @{}({}) {{", ret_llvm, emit_name, params_ir.join(", ")));
         self.emit("entry:");
 
         for p in &f.params {
@@ -437,7 +479,7 @@ impl Codegen {
         self.pop_scope();
     }
 
-    fn emit_main(&mut self, stmts: &[Stmt]) {
+    fn emit_main(&mut self, stmts: &[Stmt], has_user_main: bool) {
         self.reg = 0;
         self.label = 0;
         self.slot_id = 0;
@@ -448,7 +490,13 @@ impl Codegen {
         for stmt in stmts {
             self.emit_stmt(stmt);
         }
-        self.emit("  ret i32 0");
+        if has_user_main {
+            self.emit("  %_exit = call i64 @ionic_user_main()");
+            self.emit("  %_exit32 = trunc i64 %_exit to i32");
+            self.emit("  ret i32 %_exit32");
+        } else {
+            self.emit("  ret i32 0");
+        }
         self.emit("}");
         self.emit("");
     }
@@ -461,10 +509,19 @@ impl Codegen {
                 let (val, vty) = self.emit_expr(init);
                 let resolved = ty.as_ref().map(|t| t.to_type()).unwrap_or_else(|| vty.clone());
                 let llty = Self::llvm_ty(&resolved);
-                let slot = self.fresh_slot(name);
-                self.emit(&format!("  {} = alloca {}, align 8", slot, llty));
-                self.emit(&format!("  store {} {}, ptr {}, align 8", llty, val, slot));
-                self.declare_var(name, slot, resolved);
+                if self.global_var_names.contains(name.as_str()) && self.vars.len() == 1 {
+                    // Top-level (main scope) global: store init value into the LLVM global.
+                    // Only applies at the outermost scope (vars.len()==1); function-local
+                    // variables with the same name get their own alloca and shadow the global.
+                    self.emit(&format!("  store {} {}, ptr @{}, align 8", llty, val, name));
+                    // Refresh scope entry with the resolved (more precise) type.
+                    self.declare_var(name, format!("@{}", name), resolved);
+                } else {
+                    let slot = self.fresh_slot(name);
+                    self.emit(&format!("  {} = alloca {}, align 8", slot, llty));
+                    self.emit(&format!("  store {} {}, ptr {}, align 8", llty, val, slot));
+                    self.declare_var(name, slot, resolved);
+                }
             }
 
             Stmt::Assign { target, value } => {
@@ -829,6 +886,22 @@ impl Codegen {
 
             Expr::FieldAccess { obj, field } => {
                 let (obj_val, obj_ty) = self.emit_expr(obj);
+                // .len on arrays and strings
+                if field == "len" {
+                    match &obj_ty {
+                        Type::Array(_) => {
+                            let r = self.fresh_reg();
+                            self.emit(&format!("  {} = call i64 @ionic_array_len(ptr {})", r, obj_val));
+                            return (r, Type::Int64);
+                        }
+                        Type::Str => {
+                            let r = self.fresh_reg();
+                            self.emit(&format!("  {} = call i64 @strlen(ptr {})", r, obj_val));
+                            return (r, Type::Int64);
+                        }
+                        _ => {}
+                    }
+                }
                 if let Type::Struct(sname) = &obj_ty {
                     if let Some(layout) = self.structs.get(sname).cloned() {
                         if let Some(idx) = Self::struct_field_offset(&layout, field) {
@@ -1028,6 +1101,63 @@ impl Codegen {
                 let r = self.fresh_reg();
                 self.emit(&format!("  {} = call ptr @ionic_load_model(ptr {})", r, v));
                 (r, Type::Model(Box::new(HwTarget::Cpu)))
+            }
+            "model_free" => {
+                let (v, _) = &args[0];
+                self.emit(&format!("  call void @ionic_model_free(ptr {})", v));
+                ("0".to_string(), Type::Void)
+            }
+            "piper_forward" => {
+                let (mdl, _) = &args[0];
+                let (ph, _)  = &args[1];
+                let (ns, _)  = &args[2];
+                let (ls, _)  = &args[3];
+                let (nw, _)  = &args[4];
+                let r = self.fresh_reg();
+                self.emit(&format!(
+                    "  {} = call ptr @ionic_piper_forward(ptr {}, ptr {}, double {}, double {}, double {})",
+                    r, mdl, ph, ns, ls, nw));
+                (r, Type::Array(Box::new(Type::Float64)))
+            }
+            "write_wav" => {
+                let (path, _) = &args[0];
+                let (arr, _)  = &args[1];
+                let (ns, _)   = &args[2];
+                let (sr, _)   = &args[3];
+                self.emit(&format!(
+                    "  call void @ionic_write_wav(ptr {}, ptr {}, i64 {}, i64 {})",
+                    path, arr, ns, sr));
+                ("0".to_string(), Type::Void)
+            }
+            "gguf_generate" => {
+                let (mdl, _)  = &args[0];
+                let (prompt, _) = &args[1];
+                let (max_tok, _) = &args[2];
+                let r = self.fresh_reg();
+                self.emit(&format!(
+                    "  {} = call ptr @ionic_gguf_generate(ptr {}, ptr {}, i64 {})",
+                    r, mdl, prompt, max_tok));
+                (r, Type::Str)
+            }
+            "gguf_set_temp" => {
+                let (mdl, _)  = &args[0];
+                let (temp, _) = &args[1];
+                self.emit(&format!("  call void @ionic_gguf_set_temp(ptr {}, double {})", mdl, temp));
+                ("0".to_string(), Type::Void)
+            }
+            "gguf_set_top_p" => {
+                let (mdl, _)   = &args[0];
+                let (top_p, _) = &args[1];
+                self.emit(&format!("  call void @ionic_gguf_set_top_p(ptr {}, double {})", mdl, top_p));
+                ("0".to_string(), Type::Void)
+            }
+            "fgets_stdin" => {
+                let (max_bytes, _) = &args[0];
+                let buf = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @malloc(i64 {})", buf, max_bytes));
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_fgets_stdin(ptr {}, i32 {})", r, buf, max_bytes));
+                (r, Type::Str)
             }
             "file_read" => {
                 let (v, _) = &args[0];
