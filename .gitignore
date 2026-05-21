@@ -33,3 +33,6 @@
 .vscode/
 *.swp
 *.swo
+
+# After publishing one model, no more
+models/
