@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-and-test:
+    name: Build & test
+    runs-on: macos-14      # Apple Silicon; matches primary dev environment
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install system deps
+        run: brew install llvm
+
+      - name: Build compiler
+        run: cargo build --release
+
+      - name: Smoke test — hello world
+        run: |
+          echo 'fn main() -> int64 { print("ok"); return 0; }' > /tmp/hi.ionic
+          ./target/release/ionic /tmp/hi.ionic -o /tmp/hi
+          output=$(/tmp/hi)
+          [ "$output" = "ok" ] || (echo "Expected 'ok', got '$output'"; exit 1)
+
+      - name: Smoke test — arithmetic
+        run: |
+          cat > /tmp/arith.ionic << 'EOF'
+          fn main() -> int64 {
+              let x = 6 * 7;
+              print(int64_to_str(x));
+              return 0;
+          }
+          EOF
+          ./target/release/ionic /tmp/arith.ionic -o /tmp/arith
+          output=$(/tmp/arith)
+          [ "$output" = "42" ] || (echo "Expected '42', got '$output'"; exit 1)
+
+      - name: Smoke test — standard library
+        run: |
+          ./target/release/ionic examples/stdlib_test.ionic -o /tmp/stdlib_test
+          /tmp/stdlib_test | grep -q "arr_sum = 100" || (echo "arr_sum check failed"; exit 1)
+          /tmp/stdlib_test | grep -q "contains: ok"  || (echo "contains check failed"; exit 1)

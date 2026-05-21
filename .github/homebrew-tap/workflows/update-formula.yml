@@ -1,0 +1,58 @@
+name: Update formula
+
+# Triggered by the main ionic repo's release workflow via repository_dispatch
+on:
+  repository_dispatch:
+    types: [new-release]
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rewrite formula version and checksums
+        run: |
+          python3 - \
+            "${{ github.event.client_payload.version }}" \
+            "${{ github.event.client_payload.sha256_arm }}" \
+            "${{ github.event.client_payload.sha256_x86 }}" \
+            << 'PYEOF'
+          import sys, re, pathlib
+
+          version, sha_arm, sha_x86 = sys.argv[1], sys.argv[2], sys.argv[3]
+          f   = pathlib.Path("Formula/ionic.rb")
+          src = f.read_text()
+
+          # Update version line
+          src = re.sub(r'version "v[\d.]+"', f'version "{version}"', src)
+
+          # Update URL templates (they embed #{version} so they self-update)
+          # Update sha256 inside on_arm block
+          src = re.sub(
+              r'(?s)(on_arm\b.*?sha256 ")[0-9a-fA-F]+"',
+              lambda m: m.group(0)[:m.group(0).rfind('"', 0, -1) + 1] + sha_arm + '"',
+              src,
+          )
+          # Update sha256 inside on_intel block
+          src = re.sub(
+              r'(?s)(on_intel\b.*?sha256 ")[0-9a-fA-F]+"',
+              lambda m: m.group(0)[:m.group(0).rfind('"', 0, -1) + 1] + sha_x86 + '"',
+              src,
+          )
+
+          f.write_text(src)
+          print(f"Updated formula to {version}")
+          PYEOF
+
+      - name: Commit and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ionic.rb
+          git diff --staged --quiet && echo "No changes" && exit 0
+          git commit -m "ionic ${{ github.event.client_payload.version }}"
+          git push

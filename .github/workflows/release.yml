@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write   # create GitHub Releases and upload assets
+
+jobs:
+  # ── Build native binaries ──────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-14        # Apple Silicon (arm64)
+            target: aarch64-apple-darwin
+          - os: macos-13        # Intel (x86_64)
+            target: x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install system deps
+        run: |
+          brew install llvm onnxruntime llama.cpp
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package tarball
+        run: |
+          VERSION="${{ github.ref_name }}"
+          ARCH="${{ matrix.target }}"
+          STAGING="ionic-${VERSION}-${ARCH}"
+          mkdir -p "${STAGING}/lib/std"
+
+          cp target/${{ matrix.target }}/release/ionic "${STAGING}/"
+          cp -r lib/std/                               "${STAGING}/lib/std/"
+          cp README.md                                  "${STAGING}/"
+
+          tar -czf "${STAGING}.tar.gz" "${STAGING}"
+          echo "TARBALL=${STAGING}.tar.gz" >> "$GITHUB_ENV"
+          echo "SHA256=$(shasum -a 256 "${STAGING}.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: "*.tar.gz"
+
+      - name: Save checksum for tap update
+        run: |
+          echo "${{ env.SHA256 }}  ${{ env.TARBALL }}" > checksum-${{ matrix.target }}.txt
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksum-${{ matrix.target }}
+          path: checksum-${{ matrix.target }}.txt
+
+  # ── Create GitHub Release and attach assets ────────────────────────────────
+  publish-release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+
+          gh release create "$VERSION" \
+            --title "Ionic $VERSION" \
+            --notes "$(git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:'- %s' 2>/dev/null || echo 'Initial release')" \
+            dist/tarball-aarch64-apple-darwin/*.tar.gz \
+            dist/tarball-x86_64-apple-darwin/*.tar.gz
+
+  # ── Trigger the Homebrew tap update ───────────────────────────────────────
+  update-tap:
+    name: Update Homebrew tap
+    needs: publish-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download checksums
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Read checksums
+        run: |
+          ARM_LINE=$(cat dist/checksum-aarch64-apple-darwin/checksum-aarch64-apple-darwin.txt)
+          X86_LINE=$(cat dist/checksum-x86_64-apple-darwin/checksum-x86_64-apple-darwin.txt)
+          echo "SHA256_ARM=$(echo $ARM_LINE | cut -d' ' -f1)"  >> "$GITHUB_ENV"
+          echo "SHA256_X86=$(echo $X86_LINE | cut -d' ' -f1)"  >> "$GITHUB_ENV"
+
+      - name: Trigger tap update
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          curl -X POST \
+            -H "Authorization: token $TAP_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository_owner }}/homebrew-ionic/dispatches \
+            -d "{
+              \"event_type\": \"new-release\",
+              \"client_payload\": {
+                \"version\": \"$VERSION\",
+                \"sha256_arm\": \"${{ env.SHA256_ARM }}\",
+                \"sha256_x86\": \"${{ env.SHA256_X86 }}\"
+              }
+            }"

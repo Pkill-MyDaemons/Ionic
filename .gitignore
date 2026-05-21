@@ -1,1 +1,35 @@
-/target
+# Rust build output
+/target/
+
+# Compiled Ionic binaries produced during development (ionic -o <name>)
+/bootstrap_test
+/hello
+/kw_test
+/lexer
+/lexer_mini
+/lexer_mini2
+/lexer_mini3
+/lexer_mini4
+/lexer_mini5
+/lexer_trace
+/math
+/model_test
+/parser
+/showcase
+/str_arr_test
+/str_lit_test
+/test_global_arr
+/test_globals
+/ailc
+
+# LLVM IR dumps
+*.ll
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
