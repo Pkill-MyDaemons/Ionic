@@ -40,5 +40,5 @@ if (sc_error_count != 0) {
 
 let obj_path = "/tmp/_ionic_native.o";
 codegen_program(structs_list, fns_list, top_list, obj_path);
-let link_cmd = str_concat("clang ", str_concat(obj_path, str_concat(" src/ionic_model_runtime.c -o ", out_name)));
+let link_cmd = str_concat("clang -mmacosx-version-min=13.0 ", str_concat(obj_path, str_concat(" src/ionic_model_runtime.c -o ", out_name)));
 system(link_cmd);
