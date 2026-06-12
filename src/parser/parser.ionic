@@ -1,0 +1,718 @@
+// ── Parser state ─────────────────────────────────────────────────────────────
+struct Parser {
+    pos: int64
+}
+
+mut g_parse_error       = 0;
+mut g_parse_error_count = 0;
+mut g_parse_error_msg   = "";
+
+fn parse_error(int64 line, string msg) -> int64 {
+    g_parse_error_count = g_parse_error_count + 1;
+    if (g_parse_error == 0) {
+        g_parse_error = 1;
+        g_parse_error_msg = str_concat(int64_to_str(line), str_concat(":", str_concat(int64_to_str(g_cur_col), str_concat(": ", msg))));
+        print_span(line, g_cur_col, msg);
+    }
+    return 0;
+}
+
+// Panic-mode recovery: advance to the next reliable statement-level restart point.
+// Stops BEFORE the sync token; if a ';' is found first, consumes it.
+fn p_sync_stmt(Parser p) -> int64 {
+    mut k = p_kind(p);
+    mut at_sync = 0;
+    while (at_sync == 0 && k != TOK_EOF) {
+        if (k == TOK_LET)      { at_sync = 1; }
+        if (k == TOK_MUT)      { at_sync = 1; }
+        if (k == TOK_RETURN)   { at_sync = 1; }
+        if (k == TOK_IF)       { at_sync = 1; }
+        if (k == TOK_WHILE)    { at_sync = 1; }
+        if (k == TOK_FOR)      { at_sync = 1; }
+        if (k == TOK_BREAK)    { at_sync = 1; }
+        if (k == TOK_CONTINUE) { at_sync = 1; }
+        if (k == TOK_RBRACE)   { at_sync = 1; }
+        if (k == TOK_FN)       { at_sync = 1; }
+        if (k == TOK_STRUCT)   { at_sync = 1; }
+        if (at_sync == 0) {
+            if (k == TOK_SEMI) { p_advance(p); return 0; }
+            p_advance(p);
+            k = p_kind(p);
+        }
+    }
+    return 0;
+}
+
+// Advance to the next top-level declaration boundary (fn/struct/let/mut).
+fn p_sync_top(Parser p) -> int64 {
+    mut k = p_kind(p);
+    mut at_sync = 0;
+    while (at_sync == 0 && k != TOK_EOF) {
+        if (k == TOK_FN)     { at_sync = 1; }
+        if (k == TOK_STRUCT) { at_sync = 1; }
+        if (k == TOK_LET)    { at_sync = 1; }
+        if (k == TOK_MUT)    { at_sync = 1; }
+        if (at_sync == 0) {
+            p_advance(p);
+            k = p_kind(p);
+        }
+    }
+    return 0;
+}
+
+fn p_kind(Parser p) -> int64  { return g_tok_kinds[p.pos]; }
+fn p_sv(Parser p)   -> string { return g_tok_svals[p.pos]; }
+fn p_iv(Parser p)   -> int64  { return g_tok_ivals[p.pos]; }
+fn p_line(Parser p) -> int64  { return g_tok_lines[p.pos]; }
+fn p_col(Parser p)  -> int64  { return g_tok_cols[p.pos]; }
+
+fn p_peek_kind(Parser p, int64 offset) -> int64 {
+    let idx = p.pos + offset;
+    let last = len(g_tok_kinds) - 1;
+    if (idx > last) { return TOK_EOF; }
+    return g_tok_kinds[idx];
+}
+
+fn p_advance(Parser p) -> int64 {
+    let k = p_kind(p);
+    g_cur_line = g_tok_lines[p.pos];
+    g_cur_col  = g_tok_cols[p.pos];
+    if (k != TOK_EOF) { p.pos = p.pos + 1; }
+    return k;
+}
+
+fn p_expect(Parser p, int64 expected) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    if (p_kind(p) == expected) { p_advance(p); return 1; }
+    g_cur_col = p_col(p);
+    return parse_error(p_line(p), str_concat("expected ", tok_desc(expected)));
+}
+
+fn p_expect_ident(Parser p) -> string {
+    if (g_parse_error != 0) { return ""; }
+    if (p_kind(p) == TOK_IDENT) {
+        let s = p_sv(p);
+        p_advance(p);
+        return s;
+    }
+    g_cur_col = p_col(p);
+    parse_error(p_line(p), "expected identifier");
+    return "";
+}
+
+fn parse_hw(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    let k = p_kind(p);
+    if (k == TOK_AT_GPU) {
+        p_advance(p);
+        if (p_kind(p) == TOK_LPAREN) {
+            p_advance(p);
+            let frac = p_sv(p);
+            p_advance(p);
+            p_expect(p, TOK_RPAREN);
+            return new_node(ND_HW, frac, HW_GPU_FRAC, 0, 0, 0);
+        }
+        return new_node(ND_HW, "", HW_GPU, 0, 0, 0);
+    }
+    if (k == TOK_AT_CPU) {
+        p_advance(p);
+        if (p_kind(p) == TOK_LPAREN) {
+            p_advance(p);
+            let frac = p_sv(p);
+            p_advance(p);
+            p_expect(p, TOK_RPAREN);
+            return new_node(ND_HW, frac, HW_CPU_FRAC, 0, 0, 0);
+        }
+        return new_node(ND_HW, "", HW_CPU, 0, 0, 0);
+    }
+    return 0;
+}
+
+fn parse_type(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    let k = p_kind(p);
+    if (k == TOK_KW_INT64)   { p_advance(p); return new_node(ND_TY_INT64,   "", 0, 0, 0, 0); }
+    if (k == TOK_KW_FLOAT64) { p_advance(p); return new_node(ND_TY_FLOAT64, "", 0, 0, 0, 0); }
+    if (k == TOK_KW_BOOL)    { p_advance(p); return new_node(ND_TY_BOOL,    "", 0, 0, 0, 0); }
+    if (k == TOK_KW_STRING)  { p_advance(p); return new_node(ND_TY_STRING,  "", 0, 0, 0, 0); }
+    if (k == TOK_KW_VOID)    { p_advance(p); return new_node(ND_TY_VOID,    "", 0, 0, 0, 0); }
+    if (k == TOK_KW_TENSOR) {
+        p_advance(p);
+        mut hw = 0;
+        if (p_kind(p) == TOK_AT_GPU) { p_advance(p); hw = 1; }
+        if (p_kind(p) == TOK_AT_CPU) { p_advance(p); hw = 0; }
+        return new_node(ND_TY_TENSOR, "", hw, 0, 0, 0);
+    }
+    if (k == TOK_KW_MODEL) {
+        p_advance(p);
+        mut hw = 0;
+        if (p_kind(p) == TOK_AT_GPU) { p_advance(p); hw = 1; }
+        if (p_kind(p) == TOK_AT_CPU) { p_advance(p); hw = 0; }
+        return new_node(ND_TY_MODEL, "", hw, 0, 0, 0);
+    }
+    if (k == TOK_LBRACKET) {
+        p_advance(p);
+        let inner = parse_type(p);
+        p_expect(p, TOK_RBRACKET);
+        return new_node(ND_TY_ARRAY, "", 0, inner, 0, 0);
+    }
+    if (k == TOK_IDENT) {
+        let name = p_sv(p);
+        p_advance(p);
+        return new_node(ND_TY_NAMED, name, 0, 0, 0, 0);
+    }
+    g_cur_col = p_col(p);
+    return parse_error(p_line(p), "expected type annotation");
+}
+
+fn parse_expr(Parser p) -> int64 {
+    return parse_or(p);
+}
+
+fn parse_or(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut lhs = parse_and(p);
+    while (p_kind(p) == TOK_OR_OR && g_parse_error == 0) {
+        p_advance(p);
+        let rhs = parse_and(p);
+        lhs = new_node(ND_BINOP, "", OP_OR, lhs, rhs, 0);
+    }
+    return lhs;
+}
+
+fn parse_and(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut lhs = parse_bitor(p);
+    while (p_kind(p) == TOK_AND_AND && g_parse_error == 0) {
+        p_advance(p);
+        let rhs = parse_bitor(p);
+        lhs = new_node(ND_BINOP, "", OP_AND, lhs, rhs, 0);
+    }
+    return lhs;
+}
+
+fn parse_bitor(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut lhs = parse_bitxor(p);
+    while (p_kind(p) == TOK_PIPE && g_parse_error == 0) {
+        p_advance(p);
+        let rhs = parse_bitxor(p);
+        lhs = new_node(ND_BINOP, "", OP_BITOR, lhs, rhs, 0);
+    }
+    return lhs;
+}
+
+fn parse_bitxor(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut lhs = parse_bitand(p);
+    while (p_kind(p) == TOK_CARET && g_parse_error == 0) {
+        p_advance(p);
+        let rhs = parse_bitand(p);
+        lhs = new_node(ND_BINOP, "", OP_BITXOR, lhs, rhs, 0);
+    }
+    return lhs;
+}
+
+fn parse_bitand(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut lhs = parse_eq(p);
+    while (p_kind(p) == TOK_AMP && g_parse_error == 0) {
+        p_advance(p);
+        let rhs = parse_eq(p);
+        lhs = new_node(ND_BINOP, "", OP_BITAND, lhs, rhs, 0);
+    }
+    return lhs;
+}
+
+fn parse_eq(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut lhs = parse_cmp(p);
+    mut done = 0;
+    while (done == 0 && g_parse_error == 0) {
+        mut op = 0;
+        if (p_kind(p) == TOK_EQ_EQ)  { op = OP_EQEQ; }
+        if (p_kind(p) == TOK_BANG_EQ) { op = OP_NEQ; }
+        if (op == 0) { done = 1; } else {
+            p_advance(p);
+            let rhs = parse_cmp(p);
+            lhs = new_node(ND_BINOP, "", op, lhs, rhs, 0);
+        }
+    }
+    return lhs;
+}
+
+fn parse_cmp(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut lhs = parse_shift(p);
+    mut done = 0;
+    while (done == 0 && g_parse_error == 0) {
+        mut op = 0;
+        if (p_kind(p) == TOK_LT)    { op = OP_LT; }
+        if (p_kind(p) == TOK_GT)    { op = OP_GT; }
+        if (p_kind(p) == TOK_LT_EQ) { op = OP_LTEQ; }
+        if (p_kind(p) == TOK_GT_EQ) { op = OP_GTEQ; }
+        if (op == 0) { done = 1; } else {
+            p_advance(p);
+            let rhs = parse_add(p);
+            lhs = new_node(ND_BINOP, "", op, lhs, rhs, 0);
+        }
+    }
+    return lhs;
+}
+
+fn parse_shift(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut lhs = parse_add(p);
+    mut done = 0;
+    while (done == 0 && g_parse_error == 0) {
+        mut op = 0;
+        if (p_kind(p) == TOK_LT_LT) { op = OP_SHL; }
+        if (p_kind(p) == TOK_GT_GT) { op = OP_SHR; }
+        if (op == 0) { done = 1; } else {
+            p_advance(p);
+            let rhs = parse_add(p);
+            lhs = new_node(ND_BINOP, "", op, lhs, rhs, 0);
+        }
+    }
+    return lhs;
+}
+
+fn parse_add(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut lhs = parse_mul(p);
+    mut done = 0;
+    while (done == 0 && g_parse_error == 0) {
+        mut op = 0;
+        if (p_kind(p) == TOK_PLUS)  { op = OP_ADD; }
+        if (p_kind(p) == TOK_MINUS) { op = OP_SUB; }
+        if (op == 0) { done = 1; } else {
+            p_advance(p);
+            let rhs = parse_mul(p);
+            lhs = new_node(ND_BINOP, "", op, lhs, rhs, 0);
+        }
+    }
+    return lhs;
+}
+
+fn parse_mul(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut lhs = parse_unary(p);
+    mut done = 0;
+    while (done == 0 && g_parse_error == 0) {
+        mut op = 0;
+        if (p_kind(p) == TOK_STAR)    { op = OP_MUL; }
+        if (p_kind(p) == TOK_SLASH)   { op = OP_DIV; }
+        if (p_kind(p) == TOK_PERCENT) { op = OP_MOD; }
+        if (op == 0) { done = 1; } else {
+            p_advance(p);
+            let rhs = parse_unary(p);
+            lhs = new_node(ND_BINOP, "", op, lhs, rhs, 0);
+        }
+    }
+    return lhs;
+}
+
+fn parse_unary(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    if (p_kind(p) == TOK_MINUS) {
+        p_advance(p);
+        let e = parse_unary(p);
+        return new_node(ND_UNOP, "", OP_NEG, e, 0, 0);
+    }
+    if (p_kind(p) == TOK_BANG) {
+        p_advance(p);
+        let e = parse_unary(p);
+        return new_node(ND_UNOP, "", OP_NOT, e, 0, 0);
+    }
+    if (p_kind(p) == TOK_TILDE) {
+        p_advance(p);
+        let e = parse_unary(p);
+        return new_node(ND_UNOP, "", OP_BITNOT, e, 0, 0);
+    }
+    return parse_postfix(p);
+}
+
+fn parse_arg_list(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut args = [0];
+    mut n = 0;
+    while (p_kind(p) != TOK_RPAREN && p_kind(p) != TOK_EOF && g_parse_error == 0) {
+        push(args, parse_expr(p));
+        n = n + 1;
+        if (p_kind(p) == TOK_COMMA) { p_advance(p); }
+    }
+    p_expect(p, TOK_RPAREN);
+    return build_list(args, n);
+}
+
+fn parse_postfix(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    mut base = parse_primary(p);
+    mut done = 0;
+    while (done == 0 && g_parse_error == 0) {
+        if (p_kind(p) == TOK_DOT) {
+            p_advance(p);
+            let name = p_expect_ident(p);
+            if (str_eq(name, "toGpu")) {
+                p_expect(p, TOK_LPAREN);
+                p_expect(p, TOK_RPAREN);
+                base = new_node(ND_TO_GPU, "", 0, base, 0, 0);
+            } else {
+                if (str_eq(name, "toCpu")) {
+                    p_expect(p, TOK_LPAREN);
+                    p_expect(p, TOK_RPAREN);
+                    base = new_node(ND_TO_CPU, "", 0, base, 0, 0);
+                } else {
+                    if (p_kind(p) == TOK_LPAREN) {
+                        p_advance(p);
+                        let args = parse_arg_list(p);
+                        base = new_node(ND_METHOD_CALL, name, 0, base, args, 0);
+                    } else {
+                        base = new_node(ND_FIELD_ACCESS, name, 0, base, 0, 0);
+                    }
+                }
+            }
+        } else {
+            if (p_kind(p) == TOK_LBRACKET) {
+                p_advance(p);
+                let idx = parse_expr(p);
+                p_expect(p, TOK_RBRACKET);
+                base = new_node(ND_INDEX, "", 0, base, idx, 0);
+            } else {
+                done = 1;
+            }
+        }
+    }
+    return base;
+}
+
+fn parse_primary(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    let k = p_kind(p);
+
+    if (k == TOK_INT_LIT)    { let v = p_iv(p); p_advance(p); return new_node(ND_INT,   "", v, 0, 0, 0); }
+    if (k == TOK_FLOAT_LIT)  { let s = p_sv(p); p_advance(p); return new_node(ND_FLOAT, s, str_to_float64_bits(s), 0, 0, 0); }
+    if (k == TOK_STRING_LIT) { let s = p_sv(p); p_advance(p); return new_node(ND_STR,   s,  0, 0, 0, 0); }
+    if (k == TOK_TRUE)       { p_advance(p); return new_node(ND_BOOL, "", 1, 0, 0, 0); }
+    if (k == TOK_FALSE)      { p_advance(p); return new_node(ND_BOOL, "", 0, 0, 0, 0); }
+
+    if (k == TOK_LPAREN) {
+        p_advance(p);
+        let e = parse_expr(p);
+        p_expect(p, TOK_RPAREN);
+        return e;
+    }
+
+    if (k == TOK_LBRACKET) {
+        p_advance(p);
+        mut elems = [0];
+        mut n = 0;
+        while (p_kind(p) != TOK_RBRACKET && p_kind(p) != TOK_EOF && g_parse_error == 0) {
+            push(elems, parse_expr(p));
+            n = n + 1;
+            if (p_kind(p) == TOK_COMMA) { p_advance(p); }
+        }
+        p_expect(p, TOK_RBRACKET);
+        return new_node(ND_ARRAY_LIT, "", 0, build_list(elems, n), 0, 0);
+    }
+
+    if (k == TOK_IDENT) {
+        let name = p_sv(p);
+        p_advance(p);
+        if (p_kind(p) == TOK_LPAREN) {
+            p_advance(p);
+            let args = parse_arg_list(p);
+            return new_node(ND_CALL, name, 0, args, 0, 0);
+        }
+        if (p_kind(p) == TOK_LBRACE) {
+            p_advance(p);
+            mut fields = [0];
+            mut nf = 0;
+            while (p_kind(p) != TOK_RBRACE && p_kind(p) != TOK_EOF && g_parse_error == 0) {
+                let fname = p_expect_ident(p);
+                p_expect(p, TOK_COLON);
+                let val = parse_expr(p);
+                push(fields, new_node(ND_FIELD_INIT, fname, 0, val, 0, 0));
+                nf = nf + 1;
+                if (p_kind(p) == TOK_COMMA) { p_advance(p); }
+            }
+            p_expect(p, TOK_RBRACE);
+            return new_node(ND_STRUCT_LIT, name, 0, build_list(fields, nf), 0, 0);
+        }
+        return new_node(ND_IDENT, name, 0, 0, 0, 0);
+    }
+
+    g_cur_col = p_col(p);
+    return parse_error(p_line(p), "unexpected token in expression");
+}
+
+fn parse_lvalue(Parser p) -> int64 {
+    let name = p_expect_ident(p);
+    mut base = new_node(ND_IDENT, name, 0, 0, 0, 0);
+    mut done = 0;
+    while (done == 0 && g_parse_error == 0) {
+        if (p_kind(p) == TOK_DOT) {
+            p_advance(p);
+            let field = p_expect_ident(p);
+            base = new_node(ND_FIELD_ACCESS, field, 0, base, 0, 0);
+        } else {
+            if (p_kind(p) == TOK_LBRACKET) {
+                p_advance(p);
+                let idx = parse_expr(p);
+                p_expect(p, TOK_RBRACKET);
+                base = new_node(ND_INDEX, "", 0, base, idx, 0);
+            } else {
+                done = 1;
+            }
+        }
+    }
+    return base;
+}
+
+fn is_assign_ahead(Parser p) -> bool {
+    let k1 = p_peek_kind(p, 1);
+    if (k1 == TOK_EQ) { return true; }
+    if (k1 == TOK_DOT) {
+        if (p_peek_kind(p, 3) == TOK_EQ) { return true; }
+    }
+    if (k1 == TOK_LBRACKET) {
+        mut i = 2;
+        mut depth = 1;
+        while (depth > 0 && i < 20) {
+            let kk = p_peek_kind(p, i);
+            if (kk == TOK_LBRACKET) { depth = depth + 1; }
+            if (kk == TOK_RBRACKET) { depth = depth - 1; }
+            if (kk == TOK_EOF)      { return false; }
+            i = i + 1;
+        }
+        if (p_peek_kind(p, i) == TOK_EQ) { return true; }
+    }
+    return false;
+}
+
+fn parse_block(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    p_expect(p, TOK_LBRACE);
+    mut stmts = [0];
+    mut n = 0;
+    while (p_kind(p) != TOK_RBRACE && p_kind(p) != TOK_EOF) {
+        push(stmts, parse_stmt(p));
+        n = n + 1;
+        if (g_parse_error != 0) {
+            p_sync_stmt(p);
+            g_parse_error = 0;
+        }
+    }
+    p_expect(p, TOK_RBRACE);
+    return new_node(ND_BLOCK, "", 0, build_list(stmts, n), 0, 0);
+}
+
+fn parse_stmt(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    let hw = parse_hw(p);
+    return parse_stmt_body(p, hw);
+}
+
+fn parse_stmt_body(Parser p, int64 hw) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    let k = p_kind(p);
+
+    if (k == TOK_LET || k == TOK_MUT) {
+        let mutable = k == TOK_MUT;
+        p_advance(p);
+        let name = p_expect_ident(p);
+        mut ty = 0;
+        if (p_kind(p) == TOK_COLON) { p_advance(p); ty = parse_type(p); }
+        p_expect(p, TOK_EQ);
+        let init = parse_expr(p);
+        p_expect(p, TOK_SEMI);
+        mut iv = 0;
+        if (mutable) { iv = 1; }
+        return new_node(ND_LET, name, iv, ty, init, hw);
+    }
+
+    if (k == TOK_RETURN) {
+        p_advance(p);
+        if (p_kind(p) == TOK_SEMI) { p_advance(p); return new_node(ND_RETURN, "", 0, 0, 0, 0); }
+        let e = parse_expr(p);
+        p_expect(p, TOK_SEMI);
+        return new_node(ND_RETURN, "", 0, e, 0, 0);
+    }
+
+    if (k == TOK_BREAK)    { p_advance(p); p_expect(p, TOK_SEMI); return new_node(ND_BREAK, "", 0, 0, 0, 0); }
+    if (k == TOK_CONTINUE) { p_advance(p); p_expect(p, TOK_SEMI); return new_node(ND_CONTINUE, "", 0, 0, 0, 0); }
+
+    if (k == TOK_IF) {
+        p_advance(p);
+        p_expect(p, TOK_LPAREN);
+        let cond = parse_expr(p);
+        p_expect(p, TOK_RPAREN);
+        let then_block = parse_block(p);
+        mut else_block = 0;
+        if (p_kind(p) == TOK_ELSE) {
+            p_advance(p);
+            if (p_kind(p) == TOK_IF) {
+                let inner = parse_stmt(p);
+                else_block = new_node(ND_BLOCK, "", 0, cons(inner, 0), 0, 0);
+            } else {
+                else_block = parse_block(p);
+            }
+        }
+        return new_node(ND_IF, "", 0, cond, then_block, else_block);
+    }
+
+    if (k == TOK_WHILE) {
+        p_advance(p);
+        p_expect(p, TOK_LPAREN);
+        let cond = parse_expr(p);
+        p_expect(p, TOK_RPAREN);
+        let body = parse_block(p);
+        return new_node(ND_WHILE, "", 0, cond, body, 0);
+    }
+
+    if (k == TOK_FOR) {
+        p_advance(p);
+        p_expect(p, TOK_LPAREN);
+        let var = p_expect_ident(p);
+        p_expect(p, TOK_IN);
+        let start = parse_expr(p);
+        p_expect(p, TOK_DOT_DOT);
+        let end = parse_expr(p);
+        p_expect(p, TOK_RPAREN);
+        let body = parse_block(p);
+        return new_node(ND_FOR, var, 0, start, end, body);
+    }
+
+    if (k == TOK_GPU) {
+        p_advance(p);
+        let body = parse_block(p);
+        return new_node(ND_GPU_BLOCK, "", 0, body, 0, 0);
+    }
+
+    if (k == TOK_IMPORT) {
+        p_advance(p);
+        mut parts = [0];
+        mut np = 1;
+        push(parts, new_node(ND_STR, p_expect_ident(p), 0, 0, 0, 0));
+        while (p_kind(p) == TOK_DOT) {
+            p_advance(p);
+            push(parts, new_node(ND_STR, p_expect_ident(p), 0, 0, 0, 0));
+            np = np + 1;
+        }
+        p_expect(p, TOK_SEMI);
+        return new_node(ND_IMPORT_STMT, "", 0, build_list(parts, np), 0, 0);
+    }
+
+    if (k == TOK_IDENT && is_assign_ahead(p)) {
+        let target = parse_lvalue(p);
+        p_expect(p, TOK_EQ);
+        let value = parse_expr(p);
+        p_expect(p, TOK_SEMI);
+        return new_node(ND_ASSIGN, "", 0, target, value, 0);
+    }
+
+    let e = parse_expr(p);
+    p_expect(p, TOK_SEMI);
+    return new_node(ND_EXPR_STMT, "", 0, e, 0, 0);
+}
+
+fn parse_fn(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    let line = p_line(p);
+    p_advance(p);
+    let name = p_expect_ident(p);
+    p_expect(p, TOK_LPAREN);
+
+    mut params = [0];
+    mut np = 0;
+    while (p_kind(p) != TOK_RPAREN && p_kind(p) != TOK_EOF && g_parse_error == 0) {
+        let phw = parse_hw(p);
+        let ty = parse_type(p);
+        let pname = p_expect_ident(p);
+        push(params, new_node(ND_PARAM, pname, 0, ty, 0, phw));
+        np = np + 1;
+        if (p_kind(p) == TOK_COMMA) { p_advance(p); }
+    }
+    p_expect(p, TOK_RPAREN);
+
+    mut ret_ty = 0;
+    if (p_kind(p) == TOK_ARROW) {
+        p_advance(p);
+        ret_ty = parse_type(p);
+    } else {
+        ret_ty = new_node(ND_TY_VOID, "", 0, 0, 0, 0);
+    }
+
+    let body = parse_block(p);
+    return new_node(ND_FN_DEF, name, line, build_list(params, np), ret_ty, body);
+}
+
+fn parse_struct_def(Parser p) -> int64 {
+    if (g_parse_error != 0) { return 0; }
+    p_advance(p);
+    let name = p_expect_ident(p);
+    p_expect(p, TOK_LBRACE);
+
+    mut fields = [0];
+    mut nf = 0;
+    while (p_kind(p) != TOK_RBRACE && p_kind(p) != TOK_EOF && g_parse_error == 0) {
+        let fname = p_expect_ident(p);
+        p_expect(p, TOK_COLON);
+        let ty = parse_type(p);
+        push(fields, new_node(ND_FIELD_DEF, fname, 0, ty, 0, 0));
+        nf = nf + 1;
+        if (p_kind(p) == TOK_COMMA) { p_advance(p); }
+    }
+    p_expect(p, TOK_RBRACE);
+    return new_node(ND_STRUCT_DEF, name, 0, build_list(fields, nf), 0, 0);
+}
+
+fn parse_program(Parser p) -> [int64] {
+    mut import_arr = [0]; mut ni = 0;
+    mut struct_arr = [0]; mut ns = 0;
+    mut fn_arr     = [0]; mut nf = 0;
+    mut top_arr    = [0]; mut nt = 0;
+
+    while (p_kind(p) != TOK_EOF) {
+        let hw = parse_hw(p);
+        let k  = p_kind(p);
+
+        if (k == TOK_IMPORT) {
+            p_advance(p);
+            mut parts = [0];
+            mut np = 1;
+            push(parts, new_node(ND_STR, p_expect_ident(p), 0, 0, 0, 0));
+            while (p_kind(p) == TOK_DOT) {
+                p_advance(p);
+                push(parts, new_node(ND_STR, p_expect_ident(p), 0, 0, 0, 0));
+                np = np + 1;
+            }
+            p_expect(p, TOK_SEMI);
+            push(import_arr, new_node(ND_IMPORT_STMT, "", 0, build_list(parts, np), 0, 0));
+            ni = ni + 1;
+        } else {
+            if (k == TOK_STRUCT) {
+                push(struct_arr, parse_struct_def(p));
+                ns = ns + 1;
+            } else {
+                if (k == TOK_FN) {
+                    push(fn_arr, parse_fn(p));
+                    nf = nf + 1;
+                } else {
+                    push(top_arr, parse_stmt_body(p, hw));
+                    nt = nt + 1;
+                }
+            }
+        }
+        if (g_parse_error != 0) {
+            p_sync_top(p);
+            g_parse_error = 0;
+        }
+    }
+
+    return [build_list(import_arr, ni),
+            build_list(struct_arr, ns),
+            build_list(fn_arr, nf),
+            build_list(top_arr, nt)];
+}
+

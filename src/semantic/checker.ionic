@@ -1,0 +1,1019 @@
+// ── Semantic checker ─────────────────────────────────────────────────────────
+// Depends on: lexer/tokens.ionic, lexer/lexer.ionic, parser/ast.ionic,
+//             parser/parser.ionic (must be concatenated before this file)
+// Provides: TY_* type constants, sc_program(), sc_error_count, sc_errors[]
+
+// ── Type integer constants ───────────────────────────────────────────────────
+let TY_VOID       = 0;
+let TY_INT64      = 1;
+let TY_FLOAT64    = 2;
+let TY_BOOL       = 3;
+let TY_STR        = 4;
+let TY_ARRAY      = 5;
+let TY_STRUCT     = 8;
+let TY_TENSOR_CPU = 9;
+let TY_TENSOR_GPU = 10;
+let TY_MODEL_CPU  = 11;
+let TY_MODEL_GPU  = 12;
+let TY_UNKNOWN    = 13;
+
+// ── Error collection ─────────────────────────────────────────────────────────
+mut sc_errors      = [""];
+mut sc_error_count = 0;
+mut sc_active_node = 0;  // set by sc_expr/sc_stmt so errors know which node they're on
+
+fn sc_error(string msg) -> int64 {
+    sc_error_count = sc_error_count + 1;
+    if (sc_error_count < len(sc_errors)) {
+        sc_errors[sc_error_count] = msg;
+    } else {
+        push(sc_errors, msg);
+    }
+    return 0;
+}
+
+fn sc_error_at(string ctx, string msg) -> int64 {
+    let line = nd_line[sc_active_node];
+    let col  = nd_col[sc_active_node];
+    let full = str_concat(ctx, str_concat(": ", msg));
+    print_span(line, col, full);
+    return sc_error(full);
+}
+
+// ── Type name helper ─────────────────────────────────────────────────────────
+fn ty_name(int64 ty, string sv) -> string {
+    if (ty == TY_VOID)       { return "void"; }
+    if (ty == TY_INT64)      { return "int64"; }
+    if (ty == TY_FLOAT64)    { return "float64"; }
+    if (ty == TY_BOOL)       { return "bool"; }
+    if (ty == TY_STR)        { return "string"; }
+    if (ty == TY_ARRAY)      { return "array"; }
+    if (ty == TY_STRUCT)     { return sv; }
+    if (ty == TY_TENSOR_CPU) { return "tensor@cpu"; }
+    if (ty == TY_TENSOR_GPU) { return "tensor@gpu"; }
+    if (ty == TY_MODEL_CPU)  { return "model@cpu"; }
+    if (ty == TY_MODEL_GPU)  { return "model@gpu"; }
+    if (ty == TY_UNKNOWN)    { return "unknown"; }
+    return "?";
+}
+
+// ── Node type-annotation → TY_* ──────────────────────────────────────────────
+fn node_ty_to_int(int64 ty_node) -> int64 {
+    let k = nd_kind[ty_node];
+    if (k == ND_TY_INT64)   { return TY_INT64; }
+    if (k == ND_TY_FLOAT64) { return TY_FLOAT64; }
+    if (k == ND_TY_BOOL)    { return TY_BOOL; }
+    if (k == ND_TY_STRING)  { return TY_STR; }
+    if (k == ND_TY_VOID)    { return TY_VOID; }
+    if (k == ND_TY_TENSOR)  {
+        if (nd_iv[ty_node] == 1) { return TY_TENSOR_GPU; }
+        return TY_TENSOR_CPU;
+    }
+    if (k == ND_TY_MODEL)   { return TY_MODEL_CPU; }
+    if (k == ND_TY_ARRAY)   { return TY_ARRAY; }
+    if (k == ND_TY_NAMED)   { return TY_STRUCT; }
+    return TY_UNKNOWN;
+}
+
+fn node_ty_sv(int64 ty_node) -> string {
+    if (nd_kind[ty_node] == ND_TY_NAMED) { return nd_sv[ty_node]; }
+    return "";
+}
+
+// types are compatible if they are equal or either is unknown
+fn ty_compat(int64 got, int64 want) -> bool {
+    if (want == TY_UNKNOWN || got == TY_UNKNOWN) { return true; }
+    if (got == want) { return true; }
+    // bool and int64 are the same at runtime
+    if ((got == TY_BOOL || got == TY_INT64) && (want == TY_BOOL || want == TY_INT64)) { return true; }
+    return false;
+}
+
+// ── Symbol table (scope stack with overwrite-or-extend) ───────────────────────
+mut sv_names   = [""];
+mut sv_tys     = [0];
+mut sv_svs     = [""];  // struct name (TY_STRUCT) or elem type str (TY_ARRAY)
+mut sv_muts    = [0];   // 0=let, 1=mut
+mut sv_count   = 0;
+mut frame_stk  = [0];
+mut frame_count = 0;
+
+fn sv_push_frame() -> int64 {
+    frame_count = frame_count + 1;
+    if (frame_count < len(frame_stk)) {
+        frame_stk[frame_count] = sv_count;
+    } else {
+        push(frame_stk, sv_count);
+    }
+    return 0;
+}
+
+fn sv_pop_frame() -> int64 {
+    frame_count = frame_count - 1;
+    sv_count = frame_stk[frame_count + 1];
+    return 0;
+}
+
+fn sv_declare(string name, int64 ty, string sv, int64 mut_flag) -> int64 {
+    sv_count = sv_count + 1;
+    if (sv_count < len(sv_names)) {
+        sv_names[sv_count]  = name;
+        sv_tys[sv_count]    = ty;
+        sv_svs[sv_count]    = sv;
+        sv_muts[sv_count]   = mut_flag;
+    } else {
+        push(sv_names,  name);
+        push(sv_tys,    ty);
+        push(sv_svs,    sv);
+        push(sv_muts,   mut_flag);
+    }
+    return 0;
+}
+
+fn sv_lookup_idx(string name) -> int64 {
+    mut i = sv_count;
+    while (i >= 1) {
+        if (str_eq(sv_names[i], name)) { return i; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn sv_lookup_ty(string name) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return TY_UNKNOWN; }
+    return sv_tys[i];
+}
+
+fn sv_lookup_sv_val(string name) -> string {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return ""; }
+    return sv_svs[i];
+}
+
+fn sv_lookup_mut(string name) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    return sv_muts[i];
+}
+
+fn sv_is_defined(string name) -> bool {
+    return sv_lookup_idx(name) != 0;
+}
+
+// ── Struct registry ────────────────────────────────────────────────────────────
+mut st_names  = [""];
+mut st_sizes  = [0];
+mut st_starts = [0];
+mut st_count  = 0;
+mut stf_names = [""];
+mut stf_tys   = [0];
+mut stf_svs   = [""];
+mut stf_count = 0;
+
+fn st_find(string name) -> int64 {
+    mut i = 1;
+    while (i <= st_count) {
+        if (str_eq(st_names[i], name)) { return i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn st_field_ty(int64 st_idx, string field) -> int64 {
+    if (st_idx == 0) { return TY_UNKNOWN; }
+    let start = st_starts[st_idx];
+    let sz    = st_sizes[st_idx];
+    mut i = start;
+    while (i < start + sz) {
+        if (str_eq(stf_names[i], field)) { return stf_tys[i]; }
+        i = i + 1;
+    }
+    return TY_UNKNOWN;
+}
+
+fn st_field_sv(int64 st_idx, string field) -> string {
+    if (st_idx == 0) { return ""; }
+    let start = st_starts[st_idx];
+    let sz    = st_sizes[st_idx];
+    mut i = start;
+    while (i < start + sz) {
+        if (str_eq(stf_names[i], field)) { return stf_svs[i]; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn st_field_offset(int64 st_idx, string field) -> int64 {
+    if (st_idx == 0) { return -1; }
+    let start = st_starts[st_idx];
+    let sz    = st_sizes[st_idx];
+    mut i = 0;
+    while (i < sz) {
+        if (str_eq(stf_names[start + i], field)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ── Function registry ──────────────────────────────────────────────────────────
+mut fn_names   = [""];
+mut fn_ret_tys = [0];
+mut fn_ret_svs = [""];
+mut fn_pcounts = [0];
+mut fn_pstarts = [0];
+mut fn_count   = 0;
+// Flat param table
+mut fp_tys   = [0];
+mut fp_svs   = [""];
+mut fp_count = 0;
+
+fn fn_find(string name) -> int64 {
+    mut i = 1;
+    while (i <= fn_count) {
+        if (str_eq(fn_names[i], name)) { return i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn fn_ret_ty(string name) -> int64 {
+    let i = fn_find(name);
+    if (i == 0) { return TY_UNKNOWN; }
+    return fn_ret_tys[i];
+}
+
+fn fn_ret_sv(string name) -> string {
+    let i = fn_find(name);
+    if (i == 0) { return ""; }
+    return fn_ret_svs[i];
+}
+
+fn fn_pcount(string name) -> int64 {
+    let i = fn_find(name);
+    if (i == 0) { return -1; }
+    return fn_pcounts[i];
+}
+
+fn fn_param_ty(string name, int64 param_idx) -> int64 {
+    let fi = fn_find(name);
+    if (fi == 0) { return TY_UNKNOWN; }
+    let base = fn_pstarts[fi];
+    return fp_tys[base + param_idx - 1];
+}
+
+fn fn_param_sv(string name, int64 param_idx) -> string {
+    let fi = fn_find(name);
+    if (fi == 0) { return ""; }
+    let base = fn_pstarts[fi];
+    return fp_svs[base + param_idx - 1];
+}
+
+// ── Current function context for return-type checking ─────────────────────────
+mut sc_cur_fn_ret_ty = 0;
+mut sc_cur_fn_ret_sv = "";
+mut sc_cur_fn_name   = "";
+mut sc_in_gpu_block  = 0;
+mut sc_in_conversion = 0;   // 1 while evaluating .toGpu()/.toCpu() operand
+
+// ── GPU/tensor helpers ────────────────────────────────────────────────────────
+fn is_tensor_ty(int64 ty) -> bool {
+    return ty == TY_TENSOR_CPU || ty == TY_TENSOR_GPU;
+}
+
+fn tensor_convert_hint(int64 got, int64 want) -> string {
+    if (got == TY_TENSOR_CPU && want == TY_TENSOR_GPU) { return " (call .toGpu() to convert)"; }
+    if (got == TY_TENSOR_GPU && want == TY_TENSOR_CPU) { return " (call .toCpu() to convert)"; }
+    return "";
+}
+
+// Functions that access CPU state and are banned inside gpu {} blocks
+fn is_cpu_only_fn(string name) -> bool {
+    if (str_eq(name, "print"))          { return true; }
+    if (str_eq(name, "file_read"))      { return true; }
+    if (str_eq(name, "file_write"))     { return true; }
+    if (str_eq(name, "get_arg"))        { return true; }
+    if (str_eq(name, "cpu_core_count")) { return true; }
+    return false;
+}
+
+// ── sc_expr result globals ────────────────────────────────────────────────────
+mut sc_ty      = 0;
+mut sc_sv      = "";
+mut sc_elem_ty = 0;
+
+// ── Struct pre-pass ────────────────────────────────────────────────────────────
+fn register_struct_node(int64 node) -> int64 {
+    let name        = nd_sv[node];
+    let fields_list = nd_i2[node];
+    st_count = st_count + 1;
+    if (st_count < len(st_names)) { st_names[st_count] = name; }
+    else { push(st_names, name); }
+    let start = stf_count + 1;
+    if (st_count < len(st_starts)) { st_starts[st_count] = start; }
+    else { push(st_starts, start); }
+    mut size = 0;
+    mut fnode = fields_list;
+    while (fnode != 0) {
+        let fld   = nd_i2[fnode];
+        let fname = nd_sv[fld];
+        let fty_n = nd_i2[fld];
+        let fty   = node_ty_to_int(fty_n);
+        let ftsv  = node_ty_sv(fty_n);
+        stf_count = stf_count + 1;
+        if (stf_count < len(stf_names)) {
+            stf_names[stf_count] = fname;
+            stf_tys[stf_count]   = fty;
+            stf_svs[stf_count]   = ftsv;
+        } else {
+            push(stf_names, fname);
+            push(stf_tys,   fty);
+            push(stf_svs,   ftsv);
+        }
+        size  = size + 1;
+        fnode = nd_i3[fnode];
+    }
+    if (st_count < len(st_sizes)) { st_sizes[st_count] = size; }
+    else { push(st_sizes, size); }
+    return 0;
+}
+
+fn pre_pass_structs(int64 structs_list) -> int64 {
+    mut snode = structs_list;
+    while (snode != 0) { register_struct_node(nd_i2[snode]); snode = nd_i3[snode]; }
+    return 0;
+}
+
+// ── Function signature pre-pass ───────────────────────────────────────────────
+fn register_fn_node(int64 node) -> int64 {
+    let name        = nd_sv[node];
+    let params_list = nd_i2[node];
+    let ret_ty_nd   = nd_i3[node];
+    mut ret_ty = TY_VOID;
+    mut ret_sv = "";
+    if (ret_ty_nd != 0) { ret_ty = node_ty_to_int(ret_ty_nd); ret_sv = node_ty_sv(ret_ty_nd); }
+    fn_count = fn_count + 1;
+    if (fn_count < len(fn_names)) {
+        fn_names[fn_count]   = name;
+        fn_ret_tys[fn_count] = ret_ty;
+        fn_ret_svs[fn_count] = ret_sv;
+    } else {
+        push(fn_names,   name);
+        push(fn_ret_tys, ret_ty);
+        push(fn_ret_svs, ret_sv);
+    }
+    let pstart = fp_count + 1;
+    if (fn_count < len(fn_pstarts)) { fn_pstarts[fn_count] = pstart; }
+    else { push(fn_pstarts, pstart); }
+    mut pcount = 0;
+    mut pnode = params_list;
+    while (pnode != 0) {
+        let param = nd_i2[pnode];
+        let pty   = node_ty_to_int(nd_i2[param]);
+        let ptsv  = node_ty_sv(nd_i2[param]);
+        fp_count = fp_count + 1;
+        if (fp_count < len(fp_tys)) { fp_tys[fp_count] = pty; fp_svs[fp_count] = ptsv; }
+        else { push(fp_tys, pty); push(fp_svs, ptsv); }
+        pcount = pcount + 1;
+        pnode  = nd_i3[pnode];
+    }
+    if (fn_count < len(fn_pcounts)) { fn_pcounts[fn_count] = pcount; }
+    else { push(fn_pcounts, pcount); }
+    return 0;
+}
+
+fn pre_pass_fns(int64 fns_list) -> int64 {
+    mut fnode = fns_list;
+    while (fnode != 0) { register_fn_node(nd_i2[fnode]); fnode = nd_i3[fnode]; }
+    return 0;
+}
+
+// ── Built-in function registration ────────────────────────────────────────────
+fn register_builtin(string name, int64 pcount, int64 ret_ty, string ret_sv) -> int64 {
+    fn_count = fn_count + 1;
+    if (fn_count < len(fn_names)) {
+        fn_names[fn_count]   = name;
+        fn_ret_tys[fn_count] = ret_ty;
+        fn_ret_svs[fn_count] = ret_sv;
+        fn_pcounts[fn_count] = pcount;
+    } else {
+        push(fn_names,   name);
+        push(fn_ret_tys, ret_ty);
+        push(fn_ret_svs, ret_sv);
+        push(fn_pcounts, pcount);
+    }
+    let pstart = fp_count + 1;
+    if (fn_count < len(fn_pstarts)) { fn_pstarts[fn_count] = pstart; }
+    else { push(fn_pstarts, pstart); }
+    // Push TY_UNKNOWN for each param so any arg type is accepted
+    mut pi = 0;
+    while (pi < pcount) {
+        fp_count = fp_count + 1;
+        if (fp_count < len(fp_tys)) { fp_tys[fp_count] = TY_UNKNOWN; fp_svs[fp_count] = ""; }
+        else { push(fp_tys, TY_UNKNOWN); push(fp_svs, ""); }
+        pi = pi + 1;
+    }
+    return 0;
+}
+
+fn register_builtins() -> int64 {
+    register_builtin("print",             1, TY_VOID,    "");
+    register_builtin("println",           1, TY_VOID,    "");
+    register_builtin("int64_to_str",      1, TY_STR,     "");
+    register_builtin("float64_to_str",    1, TY_STR,     "");
+    register_builtin("char_to_str",       1, TY_STR,     "");
+    register_builtin("str_concat",        2, TY_STR,     "");
+    register_builtin("str_len",           1, TY_INT64,   "");
+    register_builtin("str_eq",            2, TY_INT64,   "");
+    register_builtin("str_index",         2, TY_INT64,   "");
+    register_builtin("len",               1, TY_INT64,   "");
+    register_builtin("push",              2, TY_VOID,    "");
+    register_builtin("arr_reset",         1, TY_VOID,    "");
+    register_builtin("get_arg",           1, TY_STR,     "");
+    register_builtin("file_read",         1, TY_STR,     "");
+    register_builtin("file_write",        2, TY_VOID,    "");
+    register_builtin("file_write_binary", 2, TY_VOID,    "");
+    register_builtin("system",            1, TY_INT64,   "");
+    register_builtin("sqrt",              1, TY_FLOAT64, "");
+    register_builtin("fabs",              1, TY_FLOAT64, "");
+    register_builtin("int64_to_float64",  1, TY_FLOAT64, "");
+    register_builtin("float64_to_int64",  1, TY_INT64,   "");
+    register_builtin("str_hash",          1, TY_INT64,   "");
+    register_builtin("cpu_core_count",    0, TY_INT64,   "");
+    register_builtin("exit",              1, TY_VOID,    "");
+    register_builtin("str_to_int64",      1, TY_INT64,   "");
+    register_builtin("read_line",         0, TY_STR,     "");
+    register_builtin("str_slice",         3, TY_STR,     "");
+    register_builtin("str_contains",      2, TY_INT64,   "");
+    register_builtin("str_starts_with",   2, TY_INT64,   "");
+    register_builtin("str_ends_with",     2, TY_INT64,   "");
+    register_builtin("str_replace",       3, TY_STR,     "");
+    register_builtin("min",               2, TY_INT64,   "");
+    register_builtin("max",               2, TY_INT64,   "");
+    register_builtin("abs",               1, TY_INT64,   "");
+    register_builtin("pow",               2, TY_FLOAT64, "");
+    register_builtin("floor",             1, TY_FLOAT64, "");
+    register_builtin("ceil",              1, TY_FLOAT64, "");
+    register_builtin("format",           -1, TY_STR,     "");
+    register_builtin("ionic_load_model",  1, TY_MODEL_CPU,"");
+    return 0;
+}
+
+// ── Count a CONS list ─────────────────────────────────────────────────────────
+fn cons_len(int64 list) -> int64 {
+    mut n = 0;
+    mut cur = list;
+    while (cur != 0) { n = n + 1; cur = nd_i3[cur]; }
+    return n;
+}
+
+// ── sc_expr: infer type of node, set sc_ty/sc_sv/sc_elem_ty ─────────────────
+fn sc_expr(int64 node) -> int64 {
+    if (node == 0) { sc_ty = TY_UNKNOWN; sc_sv = ""; return 0; }
+    sc_active_node = node;
+    let k = nd_kind[node];
+
+    // ── Literals ─────────────────────────────────────────────────────────────
+    if (k == ND_INT)   { sc_ty = TY_INT64;   sc_sv = ""; return 0; }
+    if (k == ND_FLOAT) { sc_ty = TY_FLOAT64; sc_sv = ""; return 0; }
+    if (k == ND_BOOL)  { sc_ty = TY_BOOL;    sc_sv = ""; return 0; }
+    if (k == ND_STR)   { sc_ty = TY_STR;     sc_sv = ""; return 0; }
+
+    // ── Variable reference ────────────────────────────────────────────────────
+    if (k == ND_IDENT) {
+        let name = nd_sv[node];
+        if (!sv_is_defined(name)) {
+            sc_error_at(str_concat("undefined variable '", str_concat(name, "'")), "not declared in this scope");
+            sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+        }
+        sc_ty = sv_lookup_ty(name);
+        sc_sv = sv_lookup_sv_val(name);
+        // tensor@cpu cannot be used directly inside a gpu block
+        if (sc_in_gpu_block == 1 && sc_ty == TY_TENSOR_CPU && sc_in_conversion == 0) {
+            sc_error_at(str_concat("tensor@cpu '", str_concat(name, "' used inside gpu block")),
+                "call .toGpu() to move it to the GPU first");
+        }
+        // tensor@gpu cannot be used directly outside a gpu block
+        if (sc_in_gpu_block == 0 && sc_ty == TY_TENSOR_GPU && sc_in_conversion == 0) {
+            sc_error_at(str_concat("tensor@gpu '", str_concat(name, "' used outside gpu block")),
+                "call .toCpu() to bring it back to the CPU first");
+        }
+        return 0;
+    }
+
+    // ── Binary operators ──────────────────────────────────────────────────────
+    if (k == ND_BINOP) {
+        let op = nd_iv[node];
+        sc_expr(nd_i2[node]); let lty = sc_ty; let lsv = sc_sv;
+        sc_expr(nd_i3[node]); let rty = sc_ty;
+
+        // Arithmetic: +, -, *, /, %
+        if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV || op == OP_MOD) {
+            if (lty == TY_STR && op == OP_ADD) {
+                if (rty != TY_STR && rty != TY_UNKNOWN) {
+                    sc_error_at("type error in +", str_concat("right side must be string, got ", ty_name(rty, "")));
+                }
+                sc_ty = TY_STR; sc_sv = ""; return 0;
+            }
+            if (lty != TY_UNKNOWN && rty != TY_UNKNOWN) {
+                if (lty != TY_INT64 && lty != TY_FLOAT64) {
+                    sc_error_at("type error in arithmetic", str_concat("expected numeric type, got ", ty_name(lty, lsv)));
+                }
+                if (lty == TY_FLOAT64 || rty == TY_FLOAT64) {
+                    sc_ty = TY_FLOAT64; sc_sv = "";
+                    // Promote integer op to float op in the AST node
+                    if (op == OP_ADD) { nd_iv[node] = OP_FADD; }
+                    if (op == OP_SUB) { nd_iv[node] = OP_FSUB; }
+                    if (op == OP_MUL) { nd_iv[node] = OP_FMUL; }
+                    if (op == OP_DIV) { nd_iv[node] = OP_FDIV; }
+                    return 0;
+                }
+            }
+            sc_ty = TY_INT64; sc_sv = ""; return 0;
+        }
+
+        // Comparisons: ==, !=, <, >, <=, >=
+        if (op == OP_EQEQ || op == OP_NEQ) {
+            if (lty != TY_UNKNOWN && rty != TY_UNKNOWN && !ty_compat(lty, rty)) {
+                sc_error_at("type error in ==", str_concat(str_concat("cannot compare ", ty_name(lty, lsv)), str_concat(" with ", ty_name(rty, ""))));
+            }
+            sc_ty = TY_BOOL; sc_sv = ""; return 0;
+        }
+        if (op == OP_LT || op == OP_GT || op == OP_LTEQ || op == OP_GTEQ) {
+            if (lty != TY_UNKNOWN && lty != TY_INT64 && lty != TY_FLOAT64) {
+                sc_error_at("type error in comparison", str_concat("expected numeric type, got ", ty_name(lty, lsv)));
+            }
+            sc_ty = TY_BOOL; sc_sv = ""; return 0;
+        }
+
+        // Logical: &&, ||
+        if (op == OP_AND || op == OP_OR) {
+            sc_ty = TY_BOOL; sc_sv = ""; return 0;
+        }
+
+        sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+    }
+
+    // ── Unary operators ───────────────────────────────────────────────────────
+    if (k == ND_UNOP) {
+        let op = nd_iv[node];
+        sc_expr(nd_i2[node]); let uty = sc_ty;
+        if (op == OP_NEG) {
+            if (uty != TY_INT64 && uty != TY_FLOAT64 && uty != TY_UNKNOWN) {
+                sc_error_at("type error in unary -", str_concat("expected numeric, got ", ty_name(uty, "")));
+            }
+            sc_ty = uty; sc_sv = ""; return 0;
+        }
+        if (op == OP_NOT) {
+            sc_ty = TY_BOOL; sc_sv = ""; return 0;
+        }
+        sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+    }
+
+    // ── Function call ─────────────────────────────────────────────────────────
+    if (k == ND_CALL) {
+        let callee = nd_sv[node];
+        let args_list = nd_i2[node];
+        let got_argc = cons_len(args_list);
+
+        if (sc_in_gpu_block == 1 && is_cpu_only_fn(callee)) {
+            sc_error_at(str_concat("'", str_concat(callee, "' is CPU-only I/O, not allowed inside gpu block")),
+                "gpu blocks may only perform tensor compute");
+        }
+
+        let fi = fn_find(callee);
+        if (fi == 0) {
+            sc_error_at(str_concat("unknown function '", str_concat(callee, "'")), "not declared");
+            sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+        }
+
+        let want_argc = fn_pcounts[fi];
+        if (want_argc >= 0 && got_argc != want_argc) {
+            sc_error_at(str_concat("wrong arg count calling '", str_concat(callee, "'")),
+                str_concat(str_concat("expected ", int64_to_str(want_argc)),
+                           str_concat(", got ", int64_to_str(got_argc))));
+        }
+
+        mut anode = args_list;
+        mut pidx  = 1;
+        while (anode != 0) {
+            sc_expr(nd_i2[anode]);
+            let arg_ty = sc_ty;
+            if (pidx <= want_argc) {
+                let base = fn_pstarts[fi];
+                let paty = fp_tys[base + pidx - 1];
+                let pasv = fp_svs[base + pidx - 1];
+                if (!ty_compat(arg_ty, paty)) {
+                    sc_error_at(str_concat("type error in arg ", str_concat(int64_to_str(pidx), str_concat(" of '", str_concat(callee, "'")))),
+                        str_concat(str_concat(str_concat("expected ", ty_name(paty, pasv)),
+                                              str_concat(", got ", ty_name(arg_ty, ""))),
+                                   tensor_convert_hint(arg_ty, paty)));
+                }
+            }
+            anode = nd_i3[anode];
+            pidx  = pidx + 1;
+        }
+
+        sc_ty  = fn_ret_tys[fi];
+        sc_sv  = fn_ret_svs[fi];
+        return 0;
+    }
+
+    // ── Method call: obj.method(args) ─────────────────────────────────────────
+    if (k == ND_METHOD_CALL) {
+        let method = nd_sv[node];
+        sc_expr(nd_i2[node]); let obj_ty = sc_ty; let obj_sv = sc_sv;
+
+        if (str_eq(method, "push")) {
+            sc_ty = TY_VOID; sc_sv = ""; return 0;
+        }
+        if (str_eq(method, "toGpu")) {
+            if (obj_ty != TY_TENSOR_CPU && obj_ty != TY_UNKNOWN) {
+                sc_error_at("toGpu", "can only call toGpu() on tensor@cpu");
+            }
+            sc_ty = TY_TENSOR_GPU; sc_sv = ""; return 0;
+        }
+        if (str_eq(method, "toCpu")) {
+            if (obj_ty != TY_TENSOR_GPU && obj_ty != TY_UNKNOWN) {
+                sc_error_at("toCpu", "can only call toCpu() on tensor@gpu");
+            }
+            sc_ty = TY_TENSOR_CPU; sc_sv = ""; return 0;
+        }
+        if (str_eq(method, "forward")) {
+            sc_ty = TY_TENSOR_CPU; sc_sv = ""; return 0;
+        }
+        sc_error_at(str_concat("unknown method '", str_concat(method, "'")), "no such method");
+        sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+    }
+
+    // ── Field access: obj.field ───────────────────────────────────────────────
+    if (k == ND_FIELD_ACCESS) {
+        let field = nd_sv[node];
+        sc_expr(nd_i2[node]); let obj_ty = sc_ty; let obj_sv = sc_sv;
+        if (obj_ty == TY_UNKNOWN) { sc_ty = TY_UNKNOWN; sc_sv = ""; return 0; }
+        if (obj_ty == TY_ARRAY && str_eq(field, "len")) {
+            sc_ty = TY_INT64; sc_sv = ""; return 0;
+        }
+        if (obj_ty != TY_STRUCT) {
+            sc_error_at(str_concat("field access on non-struct '", str_concat(field, "'")), ty_name(obj_ty, obj_sv));
+            sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+        }
+        let st_idx = st_find(obj_sv);
+        if (st_idx == 0) {
+            sc_error_at(str_concat("unknown struct '", str_concat(obj_sv, "'")), "not declared");
+            sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+        }
+        let fty = st_field_ty(st_idx, field);
+        if (fty == TY_UNKNOWN) {
+            sc_error_at(str_concat("no field '", str_concat(field, str_concat("' on struct '", str_concat(obj_sv, "'")))), "");
+        }
+        sc_ty = fty; sc_sv = st_field_sv(st_idx, field); return 0;
+    }
+
+    // ── Array index: arr[i] ───────────────────────────────────────────────────
+    if (k == ND_INDEX) {
+        sc_expr(nd_i2[node]); let obj_ty = sc_ty; let obj_sv = sc_sv;
+        sc_expr(nd_i3[node]); let idx_ty = sc_ty;
+        if (idx_ty != TY_INT64 && idx_ty != TY_UNKNOWN) {
+            sc_error_at("array index", str_concat("index must be int64, got ", ty_name(idx_ty, "")));
+        }
+        if (obj_ty == TY_STR) {
+            sc_ty = TY_INT64; sc_sv = ""; return 0;
+        }
+        if (obj_ty == TY_ARRAY) {
+            sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+        }
+        if (obj_ty != TY_UNKNOWN) {
+            sc_error_at("index operator", str_concat("cannot index into ", ty_name(obj_ty, obj_sv)));
+        }
+        sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+    }
+
+    // ── Array literal ─────────────────────────────────────────────────────────
+    if (k == ND_ARRAY_LIT) {
+        mut elem_ty = TY_UNKNOWN;
+        mut enode = nd_i2[node];
+        while (enode != 0) {
+            sc_expr(nd_i2[enode]);
+            if (elem_ty == TY_UNKNOWN && sc_ty != TY_UNKNOWN) { elem_ty = sc_ty; }
+            else if (!ty_compat(sc_ty, elem_ty) && sc_ty != TY_UNKNOWN) {
+                sc_error_at("array literal", str_concat("mixed element types: ", str_concat(ty_name(elem_ty, ""), str_concat(" and ", ty_name(sc_ty, "")))));
+            }
+            enode = nd_i3[enode];
+        }
+        sc_elem_ty = elem_ty;
+        sc_ty = TY_ARRAY; sc_sv = ""; return 0;
+    }
+
+    // ── Struct literal ────────────────────────────────────────────────────────
+    if (k == ND_STRUCT_LIT) {
+        let sname = nd_sv[node];
+        let st_idx = st_find(sname);
+        if (st_idx == 0) {
+            sc_error_at(str_concat("unknown struct '", str_concat(sname, "'")), "not declared");
+            sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+        }
+        mut finit = nd_i2[node];
+        while (finit != 0) {
+            let fnode = nd_i2[finit];
+            let fname = nd_sv[fnode];
+            let fval  = nd_i2[fnode];
+            let decl_ty = st_field_ty(st_idx, fname);
+            if (decl_ty == TY_UNKNOWN) {
+                sc_error_at(str_concat("unknown field '", str_concat(fname, str_concat("' on struct '", str_concat(sname, "'")))), "");
+            } else {
+                sc_expr(fval);
+                if (!ty_compat(sc_ty, decl_ty)) {
+                    sc_error_at(str_concat("field '", str_concat(fname, "'")),
+                        str_concat(str_concat("expected ", ty_name(decl_ty, st_field_sv(st_idx, fname))),
+                                   str_concat(", got ", ty_name(sc_ty, ""))));
+                }
+            }
+            finit = nd_i3[finit];
+        }
+        sc_ty = TY_STRUCT; sc_sv = sname; return 0;
+    }
+
+    // ── .toGpu() / .toCpu() as expression form ────────────────────────────────
+    if (k == ND_TO_GPU) {
+        sc_in_conversion = 1;
+        sc_expr(nd_i2[node]);
+        sc_in_conversion = 0;
+        if (sc_ty != TY_TENSOR_CPU && sc_ty != TY_UNKNOWN) {
+            sc_error_at("toGpu", "operand must be tensor@cpu");
+        }
+        sc_ty = TY_TENSOR_GPU; sc_sv = ""; return 0;
+    }
+    if (k == ND_TO_CPU) {
+        sc_in_conversion = 1;
+        sc_expr(nd_i2[node]);
+        sc_in_conversion = 0;
+        if (sc_ty != TY_TENSOR_GPU && sc_ty != TY_UNKNOWN) {
+            sc_error_at("toCpu", "operand must be tensor@gpu");
+        }
+        sc_ty = TY_TENSOR_CPU; sc_sv = ""; return 0;
+    }
+
+    sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
+}
+
+// ── sc_block_stmts: check statements inside a ND_BLOCK node ──────────────────
+fn sc_block_stmts(int64 block_node) -> int64 {
+    if (block_node == 0) { return 0; }
+    mut cur = nd_i2[block_node];
+    while (cur != 0) {
+        sc_stmt(nd_i2[cur]);
+        cur = nd_i3[cur];
+    }
+    return 0;
+}
+
+// ── sc_stmt: check a single statement node ────────────────────────────────────
+fn sc_stmt(int64 node) -> int64 {
+    if (node == 0) { return 0; }
+    sc_active_node = node;
+    let k = nd_kind[node];
+
+    if (k == ND_LET) {
+        let name    = nd_sv[node];
+        let mut_flag = nd_iv[node];
+        let ty_ann  = nd_i2[node];
+        let init_nd = nd_i3[node];
+        sc_expr(init_nd);
+        let init_ty = sc_ty;
+        let init_sv_val = sc_sv;
+        sc_active_node = node;
+        mut decl_ty = init_ty;
+        mut decl_sv_val = init_sv_val;
+        if (ty_ann != 0) {
+            let ann_ty = node_ty_to_int(ty_ann);
+            let ann_sv_val = node_ty_sv(ty_ann);
+            if (!ty_compat(init_ty, ann_ty) && init_ty != TY_UNKNOWN) {
+                sc_error_at(str_concat("declaration of '", str_concat(name, "'")),
+                    str_concat(str_concat("annotation says ", ty_name(ann_ty, ann_sv_val)),
+                               str_concat(", init is ", ty_name(init_ty, ""))));
+            }
+            decl_ty = ann_ty;
+            decl_sv_val = ann_sv_val;
+        }
+        sv_declare(name, decl_ty, decl_sv_val, mut_flag);
+        return 0;
+    }
+
+    if (k == ND_ASSIGN) {
+        let target = nd_i2[node];
+        let val_nd = nd_i3[node];
+        sc_expr(val_nd); let val_ty = sc_ty; let val_sv_val = sc_sv;
+        sc_active_node = node;
+
+        let tk = nd_kind[target];
+        if (tk == ND_IDENT) {
+            let tname = nd_sv[target];
+            if (!sv_is_defined(tname)) {
+                sc_error_at(str_concat("assignment to '", str_concat(tname, "'")), "variable not declared");
+            } else {
+                if (sv_lookup_mut(tname) == 0) {
+                    sc_error_at(str_concat("assignment to immutable '", str_concat(tname, "'")), "declare with mut to allow reassignment");
+                }
+                let var_ty = sv_lookup_ty(tname);
+                if (!ty_compat(val_ty, var_ty) && val_ty != TY_UNKNOWN) {
+                    sc_error_at(str_concat("assignment to '", str_concat(tname, "'")),
+                        str_concat(str_concat(str_concat("variable is ", ty_name(var_ty, sv_lookup_sv_val(tname))),
+                                              str_concat(", value is ", ty_name(val_ty, val_sv_val))),
+                                   tensor_convert_hint(val_ty, var_ty)));
+                }
+            }
+        }
+        if (tk == ND_FIELD_ACCESS) {
+            let fname = nd_sv[target];
+            sc_expr(nd_i2[target]); let obj_ty = sc_ty; let obj_sv_val = sc_sv;
+            if (obj_ty == TY_STRUCT) {
+                let st_idx = st_find(obj_sv_val);
+                let fty = st_field_ty(st_idx, fname);
+                if (fty == TY_UNKNOWN) {
+                    sc_error_at(str_concat("no field '", str_concat(fname, str_concat("' on '", str_concat(obj_sv_val, "'")))), "");
+                } else if (!ty_compat(val_ty, fty) && val_ty != TY_UNKNOWN) {
+                    sc_error_at(str_concat("field assignment '", str_concat(fname, "'")),
+                        str_concat(str_concat("field is ", ty_name(fty, "")),
+                                   str_concat(", value is ", ty_name(val_ty, ""))));
+                }
+            }
+        }
+        if (tk == ND_INDEX) {
+            sc_expr(nd_i2[target]);
+            sc_expr(nd_i3[target]);
+        }
+        return 0;
+    }
+
+    if (k == ND_EXPR_STMT) { sc_expr(nd_i2[node]); return 0; }
+
+    if (k == ND_RETURN) {
+        let e = nd_i2[node];
+        if (e == 0) {
+            if (sc_cur_fn_ret_ty != TY_VOID && sc_cur_fn_ret_ty != TY_UNKNOWN) {
+                sc_error_at(str_concat("return in '", str_concat(sc_cur_fn_name, "'")),
+                    str_concat("function returns ", ty_name(sc_cur_fn_ret_ty, sc_cur_fn_ret_sv)));
+            }
+        } else {
+            sc_expr(e);
+            if (!ty_compat(sc_ty, sc_cur_fn_ret_ty) && sc_ty != TY_UNKNOWN && sc_cur_fn_ret_ty != TY_UNKNOWN) {
+                sc_error_at(str_concat("return in '", str_concat(sc_cur_fn_name, "'")),
+                    str_concat(str_concat("declared return ", ty_name(sc_cur_fn_ret_ty, sc_cur_fn_ret_sv)),
+                               str_concat(", got ", ty_name(sc_ty, ""))));
+            }
+        }
+        return 0;
+    }
+
+    if (k == ND_IF) {
+        let cond_nd = nd_i2[node];
+        let then_bl = nd_i3[node];
+        let else_bl = nd_i4[node];
+        sc_expr(cond_nd);
+        if (sc_ty != TY_BOOL && sc_ty != TY_INT64 && sc_ty != TY_UNKNOWN) {
+            sc_error_at("if condition", str_concat("expected bool/int64, got ", ty_name(sc_ty, "")));
+        }
+        sv_push_frame();
+        sc_block_stmts(then_bl);
+        sv_pop_frame();
+        if (else_bl != 0) {
+            sv_push_frame();
+            sc_block_stmts(else_bl);
+            sv_pop_frame();
+        }
+        return 0;
+    }
+
+    if (k == ND_WHILE) {
+        sc_expr(nd_i2[node]);
+        if (sc_ty != TY_BOOL && sc_ty != TY_INT64 && sc_ty != TY_UNKNOWN) {
+            sc_error_at("while condition", str_concat("expected bool/int64, got ", ty_name(sc_ty, "")));
+        }
+        sv_push_frame();
+        sc_block_stmts(nd_i3[node]);
+        sv_pop_frame();
+        return 0;
+    }
+
+    if (k == ND_FOR) {
+        let var_name = nd_sv[node];
+        let start_nd = nd_i2[node];
+        let end_nd   = nd_i3[node];
+        let body_bl  = nd_i4[node];
+        sc_expr(start_nd);
+        if (sc_ty != TY_INT64 && sc_ty != TY_UNKNOWN) {
+            sc_error_at("for range start", str_concat("expected int64, got ", ty_name(sc_ty, "")));
+        }
+        sc_expr(end_nd);
+        if (sc_ty != TY_INT64 && sc_ty != TY_UNKNOWN) {
+            sc_error_at("for range end", str_concat("expected int64, got ", ty_name(sc_ty, "")));
+        }
+        sv_push_frame();
+        sv_declare(var_name, TY_INT64, "", 0);
+        sc_block_stmts(body_bl);
+        sv_pop_frame();
+        return 0;
+    }
+
+    if (k == ND_GPU_BLOCK) {
+        sc_in_gpu_block = 1;
+        sv_push_frame();
+        sc_block_stmts(nd_i2[node]);
+        sv_pop_frame();
+        sc_in_gpu_block = 0;
+        return 0;
+    }
+
+    if (k == ND_BREAK || k == ND_CONTINUE) { return 0; }
+    if (k == ND_IMPORT_STMT) { return 0; }
+
+    return 0;
+}
+
+// ── sc_fn: check one function definition ──────────────────────────────────────
+fn sc_fn(int64 fn_node) -> int64 {
+    let name        = nd_sv[fn_node];
+    let params_list = nd_i2[fn_node];
+    let ret_ty_nd   = nd_i3[fn_node];
+    let body_list   = nd_i4[fn_node];
+
+    mut ret_ty = TY_VOID; mut ret_sv_val = "";
+    if (ret_ty_nd != 0) { ret_ty = node_ty_to_int(ret_ty_nd); ret_sv_val = node_ty_sv(ret_ty_nd); }
+
+    let saved_fn   = sc_cur_fn_name;
+    let saved_rty  = sc_cur_fn_ret_ty;
+    let saved_rsv  = sc_cur_fn_ret_sv;
+    sc_cur_fn_name   = name;
+    sc_cur_fn_ret_ty = ret_ty;
+    sc_cur_fn_ret_sv = ret_sv_val;
+
+    sv_push_frame();
+    mut pnode = params_list;
+    while (pnode != 0) {
+        let param = nd_i2[pnode];
+        let pname = nd_sv[param];
+        let pty   = node_ty_to_int(nd_i2[param]);
+        let ptsv  = node_ty_sv(nd_i2[param]);
+        sv_declare(pname, pty, ptsv, 0);
+        pnode = nd_i3[pnode];
+    }
+    sc_block_stmts(body_list);
+    sv_pop_frame();
+
+    sc_cur_fn_name   = saved_fn;
+    sc_cur_fn_ret_ty = saved_rty;
+    sc_cur_fn_ret_sv = saved_rsv;
+    return 0;
+}
+
+// ── sc_program: full semantic pass over a parsed program ──────────────────────
+fn sc_program(int64 structs_list, int64 fns_list, int64 top_list) -> int64 {
+    pre_pass_structs(structs_list);
+    pre_pass_fns(fns_list);
+    register_builtins();
+
+    // Pre-declare top-level globals so functions that reference them work.
+    mut snode = top_list;
+    while (snode != 0) {
+        let stmt = nd_i2[snode];
+        if (nd_kind[stmt] == ND_LET) {
+            let gname    = nd_sv[stmt];
+            let mut_flag = nd_iv[stmt];
+            let ty_ann   = nd_i2[stmt];
+            let init_nd  = nd_i3[stmt];
+            mut decl_ty = TY_UNKNOWN;
+            mut decl_sv_val = "";
+            if (ty_ann != 0) {
+                decl_ty = node_ty_to_int(ty_ann);
+                decl_sv_val = node_ty_sv(ty_ann);
+            } else {
+                let ik = nd_kind[init_nd];
+                if (ik == ND_INT || ik == ND_BOOL)   { decl_ty = TY_INT64; }
+                if (ik == ND_FLOAT)                  { decl_ty = TY_FLOAT64; }
+                if (ik == ND_STR)                    { decl_ty = TY_STR; }
+                if (ik == ND_ARRAY_LIT)              { decl_ty = TY_ARRAY; }
+                if (ik == ND_STRUCT_LIT)             { decl_ty = TY_STRUCT; decl_sv_val = nd_sv[init_nd]; }
+            }
+            sv_declare(gname, decl_ty, decl_sv_val, mut_flag);
+        }
+        snode = nd_i3[snode];
+    }
+
+    mut fnode = fns_list;
+    while (fnode != 0) {
+        sc_fn(nd_i2[fnode]);
+        fnode = nd_i3[fnode];
+    }
+
+    sc_cur_fn_name   = "<top-level>";
+    sc_cur_fn_ret_ty = TY_UNKNOWN;
+    sc_cur_fn_ret_sv = "";
+    snode = top_list;
+    while (snode != 0) {
+        sc_stmt(nd_i2[snode]);
+        snode = nd_i3[snode];
+    }
+
+    return 0;
+}

@@ -83,6 +83,36 @@ char *ionic_fgets_stdin(char *buf, int n) {
     return buf;
 }
 
+/* Create a new empty array (for array-literal codegen). */
+IonicArray *ionic_make_array(void) { return ionic_array_alloc(8); }
+
+/* Write a string to a file (text mode). */
+int64_t ionic_file_write(const char *path, const char *content) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fputs(content ? content : "", f);
+    fclose(f);
+    return 0;
+}
+
+/* Write a [int64] byte array as raw binary. Each element is one byte (0-255). */
+int64_t ionic_file_write_binary(IonicArray *arr, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    int64_t *data = (int64_t *)arr->data;
+    for (int64_t i = 0; i < arr->len; i++) {
+        uint8_t byte = (uint8_t)(data[i] & 0xFF);
+        fwrite(&byte, 1, 1, f);
+    }
+    fclose(f);
+    return arr->len;
+}
+
+int64_t ionic_arr_reset(IonicArray *arr) {
+    arr->len = 0;
+    return 0;
+}
+
 void ionic_runtime_init(int argc, char **argv) {
     ionic_argc = argc;
     ionic_argv = argv;
@@ -103,6 +133,248 @@ int64_t ionic_cpu_core_count(void) {
     return (n > 0) ? (int64_t)n : 1;
 #endif
 }
+
+/* ── File I/O builtins ────────────────────────────────────────────────────── */
+
+/* Marked weak: LLVM IR path defines ionic_file_read inline */
+__attribute__((weak))
+char *ionic_file_read(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { return (char *)""; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)(sz + 1));
+    fread(buf, 1, (size_t)sz, f);
+    buf[sz] = '\0';
+    fclose(f);
+    return buf;
+}
+
+int64_t ionic_system(const char *cmd) { return (int64_t)system(cmd); }
+
+/* ── Basic I/O builtins ───────────────────────────────────────────────────── */
+
+int64_t ionic_println(const char *s) { puts(s ? s : ""); return 0; }
+int64_t ionic_println_int64(int64_t v) { printf("%lld\n", (long long)v); return 0; }
+int64_t ionic_print(const char *s) { fputs(s ? s : "", stdout); return 0; }
+int64_t ionic_print_int64(int64_t v) { printf("%lld", (long long)v); return 0; }
+
+/* ── Math builtins ────────────────────────────────────────────────────────── */
+/* All float functions use int64 bit-pattern convention: args and return values
+   are the IEEE 754 bit representation passed through GP registers (X0/X0).
+   This avoids the ARM64 float ABI (D0) mismatch in the native codegen. */
+static inline int64_t d2i64(double v) { int64_t b; memcpy(&b, &v, 8); return b; }
+static inline double  i642d(int64_t b) { double v; memcpy(&v, &b, 8); return v; }
+
+int64_t ionic_sqrt(int64_t b) { return d2i64(sqrt(i642d(b))); }
+int64_t ionic_fabs(int64_t b) { return d2i64(fabs(i642d(b))); }
+int64_t ionic_int64_to_float64(int64_t v) { return d2i64((double)v); }
+int64_t ionic_float64_to_int64(int64_t b) { return (int64_t)i642d(b); }
+
+/* ── Float literal parsing (used internally by the Ionic parser) ─────────── */
+/* No ionic_ prefix — ionic_self generates _str_to_float64_bits directly */
+int64_t str_to_float64_bits(const char *s) {
+    if (!s || !*s) return 0;
+    return d2i64(strtod(s, NULL));
+}
+
+/* ── Conversion & hashing ─────────────────────────────────────────────────── */
+
+int64_t ionic_str_to_int64(const char *s) {
+    if (!s || !*s) return 0;
+    return (int64_t)strtoll(s, NULL, 10);
+}
+
+int64_t ionic_str_hash(const char *s) {
+    if (!s) return 0;
+    int64_t h = 5381;
+    unsigned char c;
+    while ((c = (unsigned char)*s++)) h = ((h << 5) + h) ^ c;
+    return h;
+}
+
+int64_t ionic_exit(int64_t code) { exit((int)code); return 0; }
+
+int64_t ionic_min(int64_t a, int64_t b) { return a < b ? a : b; }
+int64_t ionic_max(int64_t a, int64_t b) { return a > b ? a : b; }
+int64_t ionic_abs(int64_t v)            { return v < 0 ? -v : v; }
+int64_t ionic_pow(int64_t ab, int64_t eb) { return d2i64(pow(i642d(ab), i642d(eb))); }
+int64_t ionic_floor(int64_t b)          { return d2i64(floor(i642d(b))); }
+int64_t ionic_ceil(int64_t b)           { return d2i64(ceil(i642d(b))); }
+
+/* ── String utilities ─────────────────────────────────────────────────────── */
+
+char *ionic_read_line(void) {
+    char buf[4096];
+    if (!fgets(buf, sizeof(buf), stdin)) { char *r = (char *)malloc(1); r[0] = '\0'; return r; }
+    size_t n = strlen(buf);
+    if (n > 0 && buf[n-1] == '\n') buf[n-1] = '\0';
+    char *r = (char *)malloc(strlen(buf) + 1);
+    strcpy(r, buf);
+    return r;
+}
+
+char *ionic_str_slice(const char *s, int64_t start, int64_t end) {
+    if (!s) { char *r = (char *)malloc(1); r[0] = '\0'; return r; }
+    int64_t n = (int64_t)strlen(s);
+    if (start < 0) start = 0;
+    if (end > n) end = n;
+    if (start >= end) { char *r = (char *)malloc(1); r[0] = '\0'; return r; }
+    int64_t len = end - start;
+    char *r = (char *)malloc((size_t)(len + 1));
+    memcpy(r, s + start, (size_t)len);
+    r[len] = '\0';
+    return r;
+}
+
+int64_t ionic_str_contains(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return 0;
+    return strstr(haystack, needle) != NULL ? 1 : 0;
+}
+
+int64_t ionic_str_starts_with(const char *s, const char *prefix) {
+    if (!s || !prefix) return 0;
+    return strncmp(s, prefix, strlen(prefix)) == 0 ? 1 : 0;
+}
+
+char *ionic_str_replace(const char *s, const char *from, const char *to) {
+    if (!s || !from || !to) return (char *)(s ? s : "");
+    size_t ls = strlen(s), lf = strlen(from), lt = strlen(to);
+    if (lf == 0) { char *r = (char *)malloc(ls + 1); memcpy(r, s, ls + 1); return r; }
+    /* Count occurrences */
+    int count = 0;
+    const char *p = s;
+    while ((p = strstr(p, from))) { count++; p += lf; }
+    size_t need = ls + (size_t)count * (lt > lf ? lt - lf : 0) + 1;
+    char *r = (char *)malloc(need);
+    char *out = r;
+    p = s;
+    const char *q;
+    while ((q = strstr(p, from))) {
+        size_t pre = (size_t)(q - p);
+        memcpy(out, p, pre); out += pre;
+        memcpy(out, to, lt); out += lt;
+        p = q + lf;
+    }
+    size_t tail = strlen(p);
+    memcpy(out, p, tail + 1);
+    return r;
+}
+
+int64_t ionic_str_ends_with(const char *s, const char *suffix) {
+    if (!s || !suffix) return 0;
+    size_t ls = strlen(s), lp = strlen(suffix);
+    if (lp > ls) return 0;
+    return strcmp(s + ls - lp, suffix) == 0 ? 1 : 0;
+}
+
+/* ── String builtins ──────────────────────────────────────────────────────── */
+
+/* These are also defined inline by the LLVM IR emitter; mark weak so the
+   IR's strong definition wins when linking ionic_self via the LLVM path.
+   For the native (ARM64) path there are no IR definitions, so these are used. */
+
+__attribute__((weak))
+char *ionic_str_concat(const char *a, const char *b) {
+    if (!a) a = ""; if (!b) b = "";
+    size_t la = strlen(a), lb = strlen(b);
+    char *r = (char *)malloc(la + lb + 1);
+    memcpy(r, a, la); memcpy(r + la, b, lb); r[la + lb] = '\0';
+    return r;
+}
+
+int64_t ionic_str_eq(const char *a, const char *b) {
+    if (!a) a = ""; if (!b) b = "";
+    return strcmp(a, b) == 0 ? 1 : 0;
+}
+
+int64_t ionic_str_len(const char *s) {
+    return s ? (int64_t)strlen(s) : 0;
+}
+
+int64_t ionic_str_index(const char *s, int64_t i) {
+    if (!s || i < 0 || i >= (int64_t)strlen(s)) return 0;
+    return (int64_t)(unsigned char)s[i];
+}
+
+__attribute__((weak))
+char *ionic_int64_to_str(int64_t v) {
+    char *buf = (char *)malloc(32);
+    snprintf(buf, 32, "%lld", (long long)v);
+    return buf;
+}
+
+__attribute__((weak))
+char *ionic_float64_to_str(int64_t b) {
+    double v = i642d(b);
+    char *buf = (char *)malloc(32);
+    snprintf(buf, 32, "%g", v);
+    return buf;
+}
+
+int64_t ionic_println_float64(int64_t b) { printf("%g\n",  i642d(b)); fflush(stdout); return 0; }
+int64_t ionic_print_float64(int64_t b)   { printf("%g",    i642d(b)); fflush(stdout); return 0; }
+
+/* format("{} has {} items", s, int64_to_str(n)) — replaces {} placeholders in order */
+char *ionic_format(const char *fmt,
+    const char *a0, const char *a1, const char *a2, const char *a3,
+    const char *a4, const char *a5, const char *a6) {
+    const char *args[7] = {a0, a1, a2, a3, a4, a5, a6};
+    /* first pass: compute output length */
+    size_t out_sz = 0;
+    int ai = 0;
+    for (const char *p = fmt ? fmt : ""; *p; p++) {
+        if (*p == '{' && *(p+1) == '}') {
+            if (ai < 7 && args[ai]) out_sz += strlen(args[ai]);
+            ai++; p++;
+        } else {
+            out_sz++;
+        }
+    }
+    char *out = (char *)malloc(out_sz + 1);
+    char *op = out;
+    ai = 0;
+    for (const char *p = fmt ? fmt : ""; *p; p++) {
+        if (*p == '{' && *(p+1) == '}') {
+            const char *a = (ai < 7 && args[ai]) ? args[ai] : "";
+            size_t al = strlen(a);
+            memcpy(op, a, al); op += al;
+            ai++; p++;
+        } else {
+            *op++ = *p;
+        }
+    }
+    *op = '\0';
+    return out;
+}
+
+__attribute__((weak))
+char *ionic_char_to_str(int64_t c) {
+    char *buf = (char *)malloc(2);
+    buf[0] = (char)(c & 0x7F); buf[1] = '\0';
+    return buf;
+}
+
+/* ── Array builtins ───────────────────────────────────────────────────────── */
+
+__attribute__((weak))
+int64_t ionic_array_len(IonicArray *arr) { return arr ? arr->len : 0; }
+
+__attribute__((weak))
+int64_t ionic_array_get(IonicArray *arr, int64_t i) {
+    if (!arr || i < 0 || i >= arr->len) return 0;
+    return ((int64_t *)arr->data)[i];
+}
+
+__attribute__((weak))
+int64_t ionic_array_set(IonicArray *arr, int64_t i, int64_t v) {
+    if (!arr || i < 0 || i >= arr->len) return 0;
+    ((int64_t *)arr->data)[i] = v; return 0;
+}
+
+__attribute__((weak))
+void ionic_array_push(IonicArray *arr, int64_t v) { ionic_array_push_i64(arr, v); }
 
 /* ── Model format detection ───────────────────────────────────────────────── */
 

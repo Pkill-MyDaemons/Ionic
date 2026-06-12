@@ -1,0 +1,44 @@
+// ── Main driver ──────────────────────────────────────────────────────────────
+mut ai        = 0;
+mut src_str   = "";
+mut out_name  = "a.out";
+
+mut cur_arg = get_arg(ai);
+while (!str_eq(cur_arg, "")) {
+    if (str_eq(cur_arg, "-o")) {
+        ai = ai + 1;
+        out_name = get_arg(ai);
+    } else {
+        let content = file_read(cur_arg);
+        src_str = str_concat(src_str, str_concat(content, "\n"));
+    }
+    ai = ai + 1;
+    cur_arg = get_arg(ai);
+}
+
+g_source = src_str;
+
+let ntoks = lex_global(src_str);
+mut p = Parser { pos: 1 };
+let prog = parse_program(p);
+
+if (g_parse_error_count != 0) {
+    println(str_concat(int64_to_str(g_parse_error_count), " parse error(s) found."));
+    exit(1);
+}
+
+let structs_list = prog[1];
+let fns_list     = prog[2];
+let top_list     = prog[3];
+
+sc_program(structs_list, fns_list, top_list);
+
+if (sc_error_count != 0) {
+    println(str_concat(int64_to_str(sc_error_count), " error(s) found."));
+    exit(1);
+}
+
+let obj_path = "/tmp/_ionic_native.o";
+codegen_program(structs_list, fns_list, top_list, obj_path);
+let link_cmd = str_concat("clang ", str_concat(obj_path, str_concat(" src/ionic_model_runtime.c -o ", out_name)));
+system(link_cmd);

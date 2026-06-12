@@ -226,11 +226,15 @@ impl Codegen {
         self.emit("declare void @ionic_gguf_set_temp(ptr, double)");
         self.emit("declare void @ionic_gguf_set_top_p(ptr, double)");
         self.emit("declare ptr  @ionic_fgets_stdin(ptr, i32)");
+        self.emit("declare i64  @ionic_file_write_binary(ptr, ptr)");
+        self.emit("declare i64  @ionic_arr_reset(ptr)");
+        self.emit("declare i64  @str_to_float64_bits(ptr)");  // float literal parser helper
         // System runtime
         self.emit("declare void @ionic_runtime_init(i32, ptr)");
         self.emit("declare ptr  @ionic_get_arg(i64)");
         self.emit("declare i64  @ionic_cpu_core_count()");
         self.emit("declare i32  @access(ptr, i32)");  // POSIX file_exists
+        self.emit("declare i64  @ionic_system(ptr)");
         self.emit("");
 
         // Emit Ionic runtime helpers
@@ -779,8 +783,13 @@ impl Codegen {
                         self.emit(&format!("  {} = zext i1 {} to i64", reg, i1_reg));
                         return (reg, Type::Int64);
                     }
-                    BinOp::And   => (format!("and i64 {}, {}", lv, rv), Type::Int64),
-                    BinOp::Or    => (format!("or i64 {}, {}", lv, rv), Type::Int64),
+                    BinOp::And    => (format!("and i64 {}, {}", lv, rv), Type::Bool),
+                    BinOp::Or     => (format!("or i64 {}, {}", lv, rv), Type::Bool),
+                    BinOp::BitAnd => (format!("and i64 {}, {}", lv, rv), Type::Int64),
+                    BinOp::BitOr  => (format!("or i64 {}, {}", lv, rv),  Type::Int64),
+                    BinOp::BitXor => (format!("xor i64 {}, {}", lv, rv), Type::Int64),
+                    BinOp::Shl    => (format!("shl i64 {}, {}", lv, rv),  Type::Int64),
+                    BinOp::Shr    => (format!("ashr i64 {}, {}", lv, rv), Type::Int64),
                     _ => unreachable!(),
                 };
                 self.emit(&format!("  {} = {}", reg, instr));
@@ -801,6 +810,10 @@ impl Codegen {
                     }
                     UnOp::Not => {
                         self.emit(&format!("  {} = xor i64 {}, 1", reg, v));
+                        (reg, Type::Bool)
+                    }
+                    UnOp::BitNot => {
+                        self.emit(&format!("  {} = xor i64 {}, -1", reg, v));
                         (reg, Type::Int64)
                     }
                 }
@@ -1159,6 +1172,19 @@ impl Codegen {
                 self.emit(&format!("  {} = call ptr @ionic_fgets_stdin(ptr {}, i32 {})", r, buf, max_bytes));
                 (r, Type::Str)
             }
+            "file_write_binary" => {
+                let (arr, _) = &args[0];
+                let (path, _) = &args[1];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call i64 @ionic_file_write_binary(ptr {}, ptr {})", r, arr, path));
+                (r, Type::Int64)
+            }
+            "arr_reset" => {
+                let (arr, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call i64 @ionic_arr_reset(ptr {})", r, arr));
+                (r, Type::Int64)
+            }
             "file_read" => {
                 let (v, _) = &args[0];
                 let r = self.fresh_reg();
@@ -1226,9 +1252,16 @@ impl Codegen {
                 self.emit(&format!("  {} = sext i32 {} to i64", r, r32));
                 (r, Type::Int64)
             }
+            "system" => {
+                let (cmd, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call i64 @ionic_system(ptr {})", r, cmd));
+                (r, Type::Int64)
+            }
             other => {
-                // User-defined function
-                let ret_ty = self.fns.get(other).map(|(_, r)| r.clone()).unwrap_or(Type::Void);
+                // User-defined or extern C function.
+                // Unknown functions default to returning i64 so they can be used as arguments.
+                let ret_ty = self.fns.get(other).map(|(_, r)| r.clone()).unwrap_or(Type::Int64);
                 let llret  = Self::llvm_ty(&ret_ty).to_string();
                 let args_ir: Vec<String> = args.iter().map(|(v, t)| {
                     format!("{} {}", Self::llvm_ty(t), v)

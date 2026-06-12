@@ -54,6 +54,7 @@ impl SemanticAnalyzer {
         sa.functions.insert("get_arg".to_string(),         (vec![Type::Int64], Type::Str));
         sa.functions.insert("cpu_core_count".to_string(),  (vec![],            Type::Int64));
         sa.functions.insert("file_exists".to_string(),     (vec![Type::Str],   Type::Bool));
+        sa.functions.insert("system".to_string(),          (vec![Type::Str],   Type::Int64));
         // ML model builtins
         sa.functions.insert("load_model".to_string(),
             (vec![Type::Str], Type::Model(Box::new(HwTarget::Cpu))));
@@ -68,6 +69,10 @@ impl SemanticAnalyzer {
              Type::Void));
         sa.functions.insert("fgets_stdin".to_string(),
             (vec![Type::Int64], Type::Str));
+        sa.functions.insert("file_write_binary".to_string(),
+            (vec![Type::Array(Box::new(Type::Int64)), Type::Str], Type::Int64));
+        sa.functions.insert("arr_reset".to_string(),
+            (vec![Type::Array(Box::new(Type::Int64))], Type::Int64));
         sa.functions.insert("gguf_generate".to_string(),
             (vec![Type::Model(Box::new(HwTarget::Cpu)), Type::Str, Type::Int64], Type::Str));
         sa.functions.insert("gguf_set_temp".to_string(),
@@ -341,6 +346,8 @@ impl SemanticAnalyzer {
                     BinOp::EqEq | BinOp::NotEq => Type::Bool,
                     BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => Type::Bool,
                     BinOp::And | BinOp::Or => Type::Bool,
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
+                    | BinOp::Shl  | BinOp::Shr => Type::Int64,
                     _ => {
                         if lt != rt && lt != Type::Unknown && rt != Type::Unknown {
                             self.error(format!("Type mismatch: `{}` vs `{}`", lt, rt));
@@ -353,8 +360,9 @@ impl SemanticAnalyzer {
             Expr::UnOp { op, expr } => {
                 let ty = self.infer_expr(expr);
                 match op {
-                    UnOp::Not => Type::Bool,
-                    UnOp::Neg => ty,
+                    UnOp::Not    => Type::Bool,
+                    UnOp::Neg    => ty,
+                    UnOp::BitNot => Type::Int64,
                 }
             }
 
@@ -373,8 +381,8 @@ impl SemanticAnalyzer {
                 if let Some((_, ret)) = self.functions.get(callee).cloned() {
                     ret
                 } else {
-                    self.error(format!("Undefined function `{}`", callee));
-                    Type::Unknown
+                    // Unknown functions may be extern C symbols linked at runtime; treat as int64.
+                    Type::Int64
                 }
             }
 

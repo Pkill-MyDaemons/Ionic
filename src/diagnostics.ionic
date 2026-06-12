@@ -1,0 +1,73 @@
+// ── Token descriptions (for human-readable parse errors) ─────────────────────
+fn tok_desc(int64 kind) -> string {
+    if (kind == TOK_SEMI)     { return "';'"; }
+    if (kind == TOK_LPAREN)   { return "'('"; }
+    if (kind == TOK_RPAREN)   { return "')'"; }
+    if (kind == TOK_LBRACE)   { return "'{'"; }
+    if (kind == TOK_RBRACE)   { return "'}'"; }
+    if (kind == TOK_LBRACKET) { return "'['"; }
+    if (kind == TOK_RBRACKET) { return "']'"; }
+    if (kind == TOK_COMMA)    { return "','"; }
+    if (kind == TOK_COLON)    { return "':'"; }
+    if (kind == TOK_EQ)       { return "'='"; }
+    if (kind == TOK_ARROW)    { return "'->'"; }
+    if (kind == TOK_DOT_DOT)  { return "'..'"; }
+    if (kind == TOK_IN)       { return "'in'"; }
+    if (kind == TOK_IDENT)    { return "identifier"; }
+    return str_concat("token#", int64_to_str(kind));
+}
+
+// ── Diagnostic utilities ─────────────────────────────────────────────────────
+// Set g_source before calling print_span so it can print the source line.
+mut g_source = "";
+
+// Return the byte offset of the start of line `line` (1-based) in src.
+fn diag_line_start(string src, int64 line) -> int64 {
+    mut cur = 1;
+    mut i = 0;
+    let n = str_len(src);
+    while (i < n) {
+        if (cur == line) { return i; }
+        if (str_index(src, i) == CH_NL) { cur = cur + 1; }
+        i = i + 1;
+    }
+    return i;
+}
+
+// Extract text of one line starting at byte offset `start` (stops at \n or end).
+fn diag_extract_line(string src, int64 start) -> string {
+    mut s = "";
+    let n = str_len(src);
+    mut i = start;
+    while (i < n) {
+        let c = str_index(src, i);
+        if (c == CH_NL) { return s; }
+        s = str_concat(s, char_to_str(c));
+        i = i + 1;
+    }
+    return s;
+}
+
+// Build a string of `n` space characters.
+fn diag_spaces(int64 n) -> string {
+    mut s = "";
+    mut i = 0;
+    while (i < n) { s = str_concat(s, " "); i = i + 1; }
+    return s;
+}
+
+// Print a caret diagnostic:
+//   [error] line:col: message
+//       source line text
+//       ^
+fn print_span(int64 line, int64 col, string msg) -> int64 {
+    println(str_concat("[error] ", str_concat(int64_to_str(line), str_concat(":", str_concat(int64_to_str(col), str_concat(": ", msg))))));
+    if (str_len(g_source) > 0) {
+        let lstart = diag_line_start(g_source, line);
+        let text   = diag_extract_line(g_source, lstart);
+        println(str_concat("    ", text));
+        // col is 1-based; indent is 4 chars, so caret lands at 4+(col-1) = col+3 spaces
+        println(str_concat(diag_spaces(col + 3), "^"));
+    }
+    return 0;
+}

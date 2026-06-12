@@ -1,0 +1,117 @@
+// ── Node kind constants ──────────────────────────────────────────────────────
+let ND_NIL          = 0;
+let ND_CONS         = 1;
+let ND_INT          = 2;
+let ND_FLOAT        = 3;
+let ND_STR          = 4;
+let ND_BOOL         = 5;
+let ND_IDENT        = 6;
+let ND_BINOP        = 7;
+let ND_UNOP         = 8;
+let ND_CALL         = 9;
+let ND_METHOD_CALL  = 10;
+let ND_FIELD_ACCESS = 11;
+let ND_INDEX        = 12;
+let ND_ARRAY_LIT    = 13;
+let ND_STRUCT_LIT   = 14;
+let ND_FIELD_INIT   = 15;
+let ND_TO_GPU       = 16;
+let ND_TO_CPU       = 17;
+let ND_LET          = 20;
+let ND_ASSIGN       = 21;
+let ND_EXPR_STMT    = 22;
+let ND_RETURN       = 23;
+let ND_IF           = 24;
+let ND_WHILE        = 25;
+let ND_FOR          = 26;
+let ND_GPU_BLOCK    = 27;
+let ND_IMPORT_STMT  = 28;
+let ND_BREAK        = 29;
+let ND_CONTINUE     = 30;
+let ND_BLOCK        = 31;
+let ND_FN_DEF       = 40;
+let ND_PARAM        = 41;
+let ND_STRUCT_DEF   = 42;
+let ND_FIELD_DEF    = 43;
+let ND_TY_INT64     = 50;
+let ND_TY_FLOAT64   = 51;
+let ND_TY_BOOL      = 52;
+let ND_TY_STRING    = 53;
+let ND_TY_VOID      = 54;
+let ND_TY_TENSOR    = 55;
+let ND_TY_MODEL     = 56;
+let ND_TY_ARRAY     = 57;
+let ND_TY_NAMED     = 58;
+let ND_HW           = 60;
+
+// ── Operator constants ───────────────────────────────────────────────────────
+let OP_ADD  = 1;
+let OP_SUB  = 2;
+let OP_MUL  = 3;
+let OP_DIV  = 4;
+let OP_MOD  = 5;
+let OP_EQEQ = 6;
+let OP_NEQ  = 7;
+let OP_LT   = 8;
+let OP_GT   = 9;
+let OP_LTEQ = 10;
+let OP_GTEQ = 11;
+let OP_AND  = 12;
+let OP_OR   = 13;
+let OP_NEG    = 14;
+let OP_NOT    = 15;
+let OP_BITAND = 16;
+let OP_BITOR  = 17;
+let OP_BITXOR = 18;
+let OP_SHL    = 19;
+let OP_SHR    = 20;
+let OP_BITNOT = 21;
+let OP_FADD   = 22;
+let OP_FSUB   = 23;
+let OP_FMUL   = 24;
+let OP_FDIV   = 25;
+
+let HW_NONE     = 0;
+let HW_CPU      = 1;
+let HW_GPU      = 2;
+let HW_CPU_FRAC = 3;
+let HW_GPU_FRAC = 4;
+
+// ── Global node table ────────────────────────────────────────────────────────
+mut nd_kind = [0];
+mut nd_sv   = [""];
+mut nd_iv   = [0];
+mut nd_i2   = [0];
+mut nd_i3   = [0];
+mut nd_i4   = [0];
+mut nd_line = [0];   // source line for each node
+mut nd_col  = [0];   // source column for each node
+
+mut g_cur_line = 0;  // updated by p_advance; stamped into each new node
+mut g_cur_col  = 0;  // updated by p_advance; stamped into each new node
+
+fn new_node(int64 kind, string sv, int64 iv, int64 i2, int64 i3, int64 i4) -> int64 {
+    push(nd_kind, kind);
+    push(nd_sv,   sv);
+    push(nd_iv,   iv);
+    push(nd_i2,   i2);
+    push(nd_i3,   i3);
+    push(nd_i4,   i4);
+    push(nd_line, g_cur_line);
+    push(nd_col,  g_cur_col);
+    return len(nd_kind) - 1;
+}
+
+fn cons(int64 head, int64 tail) -> int64 {
+    return new_node(ND_CONS, "", 0, head, tail, 0);
+}
+
+fn build_list([int64] arr, int64 n) -> int64 {
+    mut result = 0;
+    mut i = n;
+    while (i >= 1) {
+        result = cons(arr[i], result);
+        i = i - 1;
+    }
+    return result;
+}
