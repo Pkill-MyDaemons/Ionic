@@ -448,6 +448,7 @@ fn register_builtins() -> int64 {
     register_builtin("str_starts_with",   2, TY_INT64,   "");
     register_builtin("str_ends_with",     2, TY_INT64,   "");
     register_builtin("str_replace",       3, TY_STR,     "");
+    register_builtin("str_to_float64_bits", 1, TY_INT64, "");
     register_builtin("min",               2, TY_INT64,   "");
     register_builtin("max",               2, TY_INT64,   "");
     register_builtin("abs",               1, TY_INT64,   "");
@@ -455,7 +456,15 @@ fn register_builtins() -> int64 {
     register_builtin("floor",             1, TY_FLOAT64, "");
     register_builtin("ceil",              1, TY_FLOAT64, "");
     register_builtin("format",           -1, TY_STR,     "");
-    register_builtin("ionic_load_model",  1, TY_MODEL_CPU,"");
+    // ML / model inference
+    register_builtin("load_model",        1, TY_MODEL_CPU,"");
+    register_builtin("model_free",        1, TY_VOID,    "");
+    register_builtin("model_forward",     2, TY_TENSOR_CPU,"");
+    register_builtin("gguf_generate",     3, TY_STR,     "");
+    register_builtin("gguf_set_temp",     2, TY_VOID,    "");
+    register_builtin("gguf_set_top_p",    2, TY_VOID,    "");
+    register_builtin("piper_forward",     5, TY_ARRAY,   "");
+    register_builtin("write_wav",         4, TY_VOID,    "");
     return 0;
 }
 

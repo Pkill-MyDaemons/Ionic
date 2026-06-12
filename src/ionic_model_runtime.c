@@ -361,15 +361,23 @@ char *ionic_char_to_str(int64_t c) {
 __attribute__((weak))
 int64_t ionic_array_len(IonicArray *arr) { return arr ? arr->len : 0; }
 
+static void ionic_bounds_panic(int64_t idx, int64_t len) {
+    fprintf(stderr, "ionic: index out of bounds: index %lld, length %lld\n",
+            (long long)idx, (long long)len);
+    exit(1);
+}
+
 __attribute__((weak))
 int64_t ionic_array_get(IonicArray *arr, int64_t i) {
-    if (!arr || i < 0 || i >= arr->len) return 0;
+    if (!arr) { fprintf(stderr, "ionic: index into null array\n"); exit(1); }
+    if (i < 0 || i >= arr->len) ionic_bounds_panic(i, arr->len);
     return ((int64_t *)arr->data)[i];
 }
 
 __attribute__((weak))
 int64_t ionic_array_set(IonicArray *arr, int64_t i, int64_t v) {
-    if (!arr || i < 0 || i >= arr->len) return 0;
+    if (!arr) { fprintf(stderr, "ionic: index into null array\n"); exit(1); }
+    if (i < 0 || i >= arr->len) ionic_bounds_panic(i, arr->len);
     ((int64_t *)arr->data)[i] = v; return 0;
 }
 

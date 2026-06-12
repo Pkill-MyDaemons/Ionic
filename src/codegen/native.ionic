@@ -560,6 +560,9 @@ fn local_reset() -> int64 {
     arr_reset(local_is_float);
     arr_reset(local_is_str);
     arr_reset(local_stypes);
+    n_csr = 0;
+    csr_base_slot = 0;
+    spill_base = 0;
     return 0;
 }
 
@@ -680,6 +683,11 @@ fn ncg_glob_find(string name) -> int64 {
 // Scratch register pool: X9-X15 for ints, D9-D15 for floats
 mut scratch_depth = 0;
 
+// Register allocator state (reset per function by local_reset)
+mut n_csr        = 0;   // params promoted to X19..X(19+n_csr-1)
+mut csr_base_slot = 0;  // slot index where CSR saves live in the frame
+mut spill_base   = 0;   // slot index where scratch spill area begins
+
 fn scratch_push() -> int64 {
     let r = REG_X9 + scratch_depth;
     scratch_depth = scratch_depth + 1;
@@ -755,16 +763,21 @@ fn ncg_expr(int64 node) -> int64 {
         let slot = local_find(name);
         if (slot >= 0) {
             let r = scratch_push();
-            let off = local_offset(slot);
             ncg_last_stype = local_get_stype(name);
             ncg_last_ty    = local_get_str(name);
-            if (off >= 0) { a64_ldr(r, REG_X29, off >> 3); }
-            else {
-                let neg = 0 - off;
-                if (neg <= 255) { a64_ldur(r, REG_X29, off); }
+            if (slot < n_csr) {
+                // Register-promoted param: read from callee-saved reg X19+slot
+                a64_mov(r, REG_X19 + slot);
+            } else {
+                let off = local_offset(slot);
+                if (off >= 0) { a64_ldr(r, REG_X29, off >> 3); }
                 else {
-                    a64_sub_imm(REG_X16, REG_X29, neg);
-                    a64_ldr(r, REG_X16, 0);
+                    let neg = 0 - off;
+                    if (neg <= 255) { a64_ldur(r, REG_X29, off); }
+                    else {
+                        a64_sub_imm(REG_X16, REG_X29, neg);
+                        a64_ldr(r, REG_X16, 0);
+                    }
                 }
             }
             if (local_is_float_slot(name) == 1) {
@@ -879,7 +892,7 @@ fn ncg_expr(int64 node) -> int64 {
         mut spill_i = 0;
         while (spill_i < live) {
             let sreg = REG_X9 + spill_i;
-            let soff = (local_count + 2 + spill_i) * 8;
+            let soff = (spill_base + 2 +spill_i) * 8;
             a64_store_fp(sreg, soff);
             spill_i = spill_i + 1;
         }
@@ -890,7 +903,7 @@ fn ncg_expr(int64 node) -> int64 {
         spill_i = 0;
         while (spill_i < live) {
             let sreg = REG_X9 + spill_i;
-            let soff = (local_count + 2 + spill_i) * 8;
+            let soff = (spill_base + 2 +spill_i) * 8;
             a64_load_fp(sreg, soff);
             spill_i = spill_i + 1;
         }
@@ -917,7 +930,7 @@ fn ncg_expr(int64 node) -> int64 {
         let mc_live = scratch_depth;
         mut mc_si = 0;
         while (mc_si < mc_live) {
-            a64_store_fp(REG_X9 + mc_si, (local_count + 2 + mc_si) * 8);
+            a64_store_fp(REG_X9 + mc_si, (spill_base + 2 +mc_si) * 8);
             mc_si = mc_si + 1;
         }
 
@@ -959,7 +972,7 @@ fn ncg_expr(int64 node) -> int64 {
         // Restore spilled scratch registers
         mc_si = 0;
         while (mc_si < mc_live) {
-            a64_load_fp(REG_X9 + mc_si, (local_count + 2 + mc_si) * 8);
+            a64_load_fp(REG_X9 + mc_si, (spill_base + 2 +mc_si) * 8);
             mc_si = mc_si + 1;
         }
 
@@ -977,7 +990,7 @@ fn ncg_expr(int64 node) -> int64 {
         let ndx_live = scratch_depth;
         mut ndx_si = 0;
         while (ndx_si < ndx_live) {
-            a64_store_fp(REG_X9 + ndx_si, (local_count + 2 + ndx_si) * 8);
+            a64_store_fp(REG_X9 + ndx_si, (spill_base + 2 +ndx_si) * 8);
             ndx_si = ndx_si + 1;
         }
         let arr_r = ncg_expr(arr_node);
@@ -992,7 +1005,7 @@ fn ncg_expr(int64 node) -> int64 {
         // Restore outer live regs AFTER the BL (BL clobbers all caller-saved regs)
         ndx_si = 0;
         while (ndx_si < ndx_live) {
-            a64_load_fp(REG_X9 + ndx_si, (local_count + 2 + ndx_si) * 8);
+            a64_load_fp(REG_X9 + ndx_si, (spill_base + 2 +ndx_si) * 8);
             ndx_si = ndx_si + 1;
         }
         let r = scratch_push();
@@ -1010,7 +1023,7 @@ fn ncg_expr(int64 node) -> int64 {
             let len_live = scratch_depth;
             mut len_si = 0;
             while (len_si < len_live) {
-                a64_store_fp(REG_X9 + len_si, (local_count + 2 + len_si) * 8);
+                a64_store_fp(REG_X9 + len_si, (spill_base + 2 +len_si) * 8);
                 len_si = len_si + 1;
             }
             let obj_r = ncg_expr(obj_node);
@@ -1020,7 +1033,7 @@ fn ncg_expr(int64 node) -> int64 {
             scratch_pop();
             len_si = 0;
             while (len_si < len_live) {
-                a64_load_fp(REG_X9 + len_si, (local_count + 2 + len_si) * 8);
+                a64_load_fp(REG_X9 + len_si, (spill_base + 2 +len_si) * 8);
                 len_si = len_si + 1;
             }
             let r = scratch_push();
@@ -1056,7 +1069,7 @@ fn ncg_expr(int64 node) -> int64 {
         let slive = scratch_depth;
         mut ssi = 0;
         while (ssi < slive) {
-            a64_store_fp(REG_X9 + ssi, (local_count + 2 + ssi) * 8);
+            a64_store_fp(REG_X9 + ssi, (spill_base + 2 +ssi) * 8);
             ssi = ssi + 1;
         }
         // malloc(byte_sz) — allocate struct on heap
@@ -1065,7 +1078,7 @@ fn ncg_expr(int64 node) -> int64 {
         a64_bl_sym(mal_sym);
         ssi = 0;
         while (ssi < slive) {
-            a64_load_fp(REG_X9 + ssi, (local_count + 2 + ssi) * 8);
+            a64_load_fp(REG_X9 + ssi, (spill_base + 2 +ssi) * 8);
             ssi = ssi + 1;
         }
         let ptr_r = scratch_push();
@@ -1097,7 +1110,7 @@ fn ncg_expr(int64 node) -> int64 {
         mut si0 = 0;
         while (si0 < live0) {
             let sreg = REG_X9 + si0;
-            let soff = (local_count + 2 + si0) * 8;
+            let soff = (spill_base + 2 +si0) * 8;
             a64_store_fp(sreg, soff);
             si0 = si0 + 1;
         }
@@ -1106,7 +1119,7 @@ fn ncg_expr(int64 node) -> int64 {
         si0 = 0;
         while (si0 < live0) {
             let sreg = REG_X9 + si0;
-            let soff = (local_count + 2 + si0) * 8;
+            let soff = (spill_base + 2 +si0) * 8;
             a64_load_fp(sreg, soff);
             si0 = si0 + 1;
         }
@@ -1123,7 +1136,7 @@ fn ncg_expr(int64 node) -> int64 {
             mut si = 0;
             while (si < nlive) {
                 let sreg = REG_X9 + si;
-                let soff = (local_count + 2 + si) * 8;
+                let soff = (spill_base + 2 +si) * 8;
                 a64_store_fp(sreg, soff);
                 si = si + 1;
             }
@@ -1133,7 +1146,7 @@ fn ncg_expr(int64 node) -> int64 {
             si = 0;
             while (si < nlive) {
                 let sreg = REG_X9 + si;
-                let soff = (local_count + 2 + si) * 8;
+                let soff = (spill_base + 2 +si) * 8;
                 a64_load_fp(sreg, soff);
                 si = si + 1;
             }
@@ -1141,6 +1154,11 @@ fn ncg_expr(int64 node) -> int64 {
             elem = nd_i3[elem];
         }
         return arr_r;
+    }
+
+    // Tensor conversions — identity at the codegen level; type safety enforced by checker
+    if (kind == ND_TO_GPU || kind == ND_TO_CPU) {
+        return ncg_expr(nd_i2[node]);
     }
 
     // Fallback
@@ -1248,6 +1266,15 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "pow"))               { real_callee = "ionic_pow"; }
     if (str_eq(callee, "floor"))             { real_callee = "ionic_floor"; }
     if (str_eq(callee, "ceil"))              { real_callee = "ionic_ceil"; }
+    // ML / model inference
+    if (str_eq(callee, "load_model"))        { real_callee = "ionic_load_model"; }
+    if (str_eq(callee, "model_free"))        { real_callee = "ionic_model_free"; }
+    if (str_eq(callee, "model_forward"))     { real_callee = "ionic_model_forward"; }
+    if (str_eq(callee, "gguf_generate"))     { real_callee = "ionic_gguf_generate"; }
+    if (str_eq(callee, "gguf_set_temp"))     { real_callee = "ionic_gguf_set_temp"; }
+    if (str_eq(callee, "gguf_set_top_p"))    { real_callee = "ionic_gguf_set_top_p"; }
+    if (str_eq(callee, "piper_forward"))     { real_callee = "ionic_piper_forward"; }
+    if (str_eq(callee, "write_wav"))         { real_callee = "ionic_write_wav"; }
 
     // Phase 3: Emit BL with relocation
     let sym = sym_undef(real_callee);
@@ -1319,14 +1346,19 @@ fn ncg_stmt(int64 node) -> int64 {
             let name = nd_sv[target];
             let slot = local_find(name);
             if (slot >= 0) {
-                let off  = local_offset(slot);
-                if (off >= 0) { a64_str(vr, REG_X29, off >> 3); }
-                else {
-                    let neg = 0 - off;
-                    if (neg <= 255) { a64_stur(vr, REG_X29, off); }
+                if (slot < n_csr) {
+                    // Register-promoted param: write to callee-saved reg X19+slot
+                    a64_mov(REG_X19 + slot, vr);
+                } else {
+                    let off  = local_offset(slot);
+                    if (off >= 0) { a64_str(vr, REG_X29, off >> 3); }
                     else {
-                        a64_sub_imm(REG_X16, REG_X29, neg);
-                        a64_str(vr, REG_X16, 0);
+                        let neg = 0 - off;
+                        if (neg <= 255) { a64_stur(vr, REG_X29, off); }
+                        else {
+                            a64_sub_imm(REG_X16, REG_X29, neg);
+                            a64_str(vr, REG_X16, 0);
+                        }
                     }
                 }
             } else {
@@ -1482,6 +1514,12 @@ fn ncg_stmt(int64 node) -> int64 {
         return 0;
     }
 
+    // gpu {} block — type-checked by checker; emit body as regular code
+    if (kind == ND_GPU_BLOCK) {
+        ncg_stmts(nd_i2[nd_i2[node]]);
+        return 0;
+    }
+
     return 0;
 }
 
@@ -1515,10 +1553,22 @@ fn ncg_fn_prologue(int64 n_locals) -> int64 {
         a64_stp(REG_X29, REG_X30, REG_SP, 0);
     }
     a64_add_imm(REG_X29, REG_SP, 0);
+    // Save callee-saved param regs X19..X(19+n_csr-1) into CSR save area
+    mut csi = 0;
+    while (csi < n_csr) {
+        a64_store_fp(REG_X19 + csi, (csr_base_slot + 2 + csi) * 8);
+        csi = csi + 1;
+    }
     return 0;
 }
 
 fn ncg_fn_epilogue() -> int64 {
+    // Restore callee-saved param regs before tearing down the frame
+    mut csi = 0;
+    while (csi < n_csr) {
+        a64_load_fp(REG_X19 + csi, (csr_base_slot + 2 + csi) * 8);
+        csi = csi + 1;
+    }
     a64_add_imm(REG_SP, REG_X29, 0);
     let fs = cur_frame_size;
     if (fs <= 504) {
@@ -1569,7 +1619,8 @@ fn count_locals_deep(int64 list) -> int64 {
 }
 
 fn count_locals(int64 list) -> int64 {
-    return count_locals_deep(list) + 8;   // +8 headroom for scratch spills (up to 7 X9-X15)
+    // +8 for CSR save slots (X19..X26) + 8 for scratch spill slots (X9..X15)
+    return count_locals_deep(list) + 16;
 }
 
 // ── Function codegen ──────────────────────────────────────────────────────────
@@ -1594,8 +1645,14 @@ fn ncg_fn_node(int64 fn_node) -> int64 {
     mut n_params = 0;
     mut pc = params;
     while (pc != 0) { n_params = n_params + 1; pc = nd_i3[pc]; }
-    let n_body   = count_locals(body_list);
-    let n_locals = n_params + n_body;
+    let n_body_base = count_locals_deep(body_list);
+    // Promote all params (up to 8) to callee-saved regs X19..X(19+n_params-1)
+    mut n_prom = n_params;
+    if (n_prom > 8) { n_prom = 8; }
+    n_csr         = n_prom;
+    csr_base_slot = n_params + n_body_base;      // CSR saves after all locals
+    spill_base    = n_params + n_body_base + 8;  // scratch spills after CSR saves
+    let n_locals  = n_params + n_body_base + 16; // 8 CSR + 8 scratch headroom
 
     // Register as defined global symbol
     let fn_addr = text_len();
@@ -1621,14 +1678,20 @@ fn ncg_fn_node(int64 fn_node) -> int64 {
 
     ncg_fn_prologue(n_locals);
 
-    // Now store params from X0..X7 to stack
+    // Move incoming args X0..X7 to their destinations.
+    // Promoted params (slot < n_csr) go to callee-saved X19+slot.
+    // Remaining params go to stack slots.
     mut pn2 = params;
     mut pi2 = 0;
     while (pn2 != 0) {
         let pname = nd_sv[nd_i2[pn2]];
         let slot  = local_find(pname);
-        let off   = local_offset(slot);
-        a64_store_fp(pi2, off);
+        if (slot < n_csr) {
+            a64_mov(REG_X19 + slot, pi2);
+        } else {
+            let off = local_offset(slot);
+            a64_store_fp(pi2, off);
+        }
         pn2 = nd_i3[pn2];
         pi2 = pi2 + 1;
     }
@@ -1650,7 +1713,11 @@ fn ncg_main_wrapper(int64 top_list) -> int64 {
 
     local_reset();
     scratch_depth = 0;
-    let n_locals = count_locals(top_list) + 4;
+    let mw_deep = count_locals_deep(top_list);
+    n_csr = 0;
+    csr_base_slot = mw_deep + 4;
+    spill_base    = mw_deep + 4 + 8;   // skip CSR area (n_csr=0 but reserve slots)
+    let n_locals  = mw_deep + 4 + 16;  // 4 slack + 8 CSR + 8 scratch headroom
     ncg_fn_prologue(n_locals);
 
     // Call ionic_runtime_init(argc, argv)
